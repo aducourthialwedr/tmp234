@@ -256,6 +256,7 @@ def test_chunked_allocation_matches_single_pass(monkeypatch):
     whole = allocate(dataset())
     monkeypatch.setattr(allocator, "CHUNK_ROWS", 3)
     monkeypatch.setattr(allocator, "NAME_PAIR_BUDGET", 1)
+    monkeypatch.setattr(allocator, "CF_PAIR_BUDGET", 1)
     monkeypatch.setattr(indexes, "_PAYMENT_CHUNK", 2)
     chunked = allocate(dataset())
     pd.testing.assert_frame_equal(whole.payments, chunked.payments)
@@ -275,3 +276,18 @@ def test_frequent_key_kept_only_through_exact_amount():
     c = a.candidates
     assert c.loc[c["payment_id"] == "P1", "debtor_id"].tolist() == ["D3"]
     assert c[c["payment_id"] == "P2"].empty
+
+
+def test_shared_iban_routes_but_proposes_no_candidate():
+    """IBAN de centralisation porté par plus de `max_debtors_per_iban` débiteurs : routage conservé, pas de candidat."""
+    debtors = [{"party_id": f"D{i}", "name": f"Societe {i}", "iban": "FR76 7777", "opened_at": "2024-01-01"}
+               for i in range(4)]
+    data = enriched(
+        assignor=[{"party_id": "A1", "name": "CEDANT", "opened_at": "2023-01-01"}], debtor=debtors,
+        agreement=[{"agreement_id": f"AGD{i}", "debtor_id": f"D{i}", "client_id": "A1", "created_at": "2024-01-01"}
+                   for i in range(4)],
+        invoice=[], payment=[pay("P1", "VIREMENT", 100, "FR76 7777")], imputation=[])
+    shared = allocate(data, settings(iban={"max_debtors_per_iban": 3}))
+    assert shared.payments.loc[0, "iban_route"] == DEBTOR_DIRECT and shared.candidates.empty
+    allowed = allocate(data, settings(iban={"max_debtors_per_iban": 4}))
+    assert sorted(allowed.candidates["debtor_id"]) == ["D0", "D1", "D2", "D3"]

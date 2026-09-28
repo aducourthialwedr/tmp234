@@ -44,6 +44,8 @@ WEIGHTS = {CLIENT_FILE: 1.0, REFERENCE: 0.95, IBAN: 0.9, NAME: 0.7, AMOUNT: 0.5}
 CHUNK_ROWS = 20_000
 # Paires (paiement, débiteur portant un mot du libellé) examinées ensemble par le signal « nom ».
 NAME_PAIR_BUDGET = 2_000_000
+# Couples (paiement, client file de même montant) examinés ensemble au rattachement des fichiers.
+CF_PAIR_BUDGET = 2_000_000
 
 _SIGNAL_COLUMNS = ["row", "debtor", "signal", "score", "strong"]
 _SIGNAL_CODE = {s: i for i, s in enumerate(SIGNALS)}
@@ -167,39 +169,50 @@ class Allocator:
         rows = np.flatnonzero(ib >= 0)
         if len(rows) == 0:
             return _empty_signal(), route
-        tech = self.iban.technical[ib[rows]]
-        d_owner, d_pos = self.iban.debtors.gather(ib[rows])
+        # Parties de chaque IBAN **distinct** du bloc, puis report sur les paiements : un IBAN partagé
+        # par des milliers de débiteurs (compte de centralisation) n'est développé qu'une fois.
+        uib, u_of = np.unique(ib[rows], return_inverse=True)
+        tech = self.iban.technical[uib]
+        d_owner, d_pos = self.iban.debtors.gather(uib)
         known = self.state.party_known_at("debtor", d_pos, as_of)
         d_owner, d_pos = d_owner[known], d_pos[known]
-        a_owner, a_pos = self.iban.assignors.gather(ib[rows])
+        a_owner, a_pos = self.iban.assignors.gather(uib)
         known = self.state.party_known_at("assignor", a_pos, as_of)
         a_owner, a_pos = a_owner[known], a_pos[known]
-        n_d = np.bincount(d_owner, minlength=len(rows))
-        n_a = np.bincount(a_owner, minlength=len(rows))
+        n_d = np.bincount(d_owner, minlength=len(uib))
+        n_a = np.bincount(a_owner, minlength=len(uib))
 
         # IBAN à la fois débiteur et cédant : arbitrage par bankroll_code du paiement s'il est connu.
         conflict = (n_d > 0) & (n_a > 0)
         to_assignor = np.zeros(len(rows), dtype=bool)
-        if conflict.any():
-            pay_br = self._pay_bankroll[pos[rows]]
-            ib_rows = ib[rows]
-            a_match = pd.DataFrame({"o": a_owner, "ib": ib_rows[a_owner], "pos": a_pos}).merge(
-                self.iban.bankroll["assignor"], on=["ib", "pos"])
-            d_match = pd.DataFrame({"o": d_owner, "ib": ib_rows[d_owner], "pos": d_pos}).merge(
-                self.iban.bankroll["debtor"], on=["ib", "pos"])
-            a_hit = np.zeros(len(rows), dtype=bool)
-            d_hit = np.zeros(len(rows), dtype=bool)
-            for frame, hit in ((a_match, a_hit), (d_match, d_hit)):
-                eq = frame["br"].to_numpy() == pay_br[frame["o"].to_numpy()]
-                hit[frame["o"].to_numpy()[eq & pd.notna(frame["br"]).to_numpy()]] = True
-            to_assignor = conflict & a_hit & ~d_hit
-        sub = np.select([tech, to_assignor, n_d > 0, n_a > 0], [TECHNICAL_ACCOUNT, ASSIGNOR, DEBTOR_DIRECT, ASSIGNOR],
+        c_rows = np.flatnonzero(conflict[u_of])
+        if len(c_rows):
+            asked = pd.DataFrame({"i": c_rows, "u": u_of[c_rows], "br": self._pay_bankroll[pos[rows[c_rows]]]})
+            hit = {}
+            for role, owner, party in (("assignor", a_owner, a_pos), ("debtor", d_owner, d_pos)):
+                in_conflict = conflict[owner]
+                brs = (pd.DataFrame({"u": owner[in_conflict], "ib": uib[owner[in_conflict]],
+                                     "pos": party[in_conflict]})
+                       .merge(self.iban.bankroll[role], on=["ib", "pos"])[["u", "br"]].dropna().drop_duplicates())
+                found = asked.dropna(subset=["br"]).merge(brs, on=["u", "br"])["i"].to_numpy()
+                hit[role] = np.zeros(len(rows), dtype=bool)
+                hit[role][found] = True
+            to_assignor = conflict[u_of] & hit["assignor"] & ~hit["debtor"]
+        nd, na = n_d[u_of], n_a[u_of]
+        sub = np.select([tech[u_of], to_assignor, nd > 0, na > 0], [TECHNICAL_ACCOUNT, ASSIGNOR, DEBTOR_DIRECT, ASSIGNOR],
                         default=UNKNOWN)
         route[rows] = sub
-        direct = (sub == DEBTOR_DIRECT)[d_owner]
-        o, d = d_owner[direct], d_pos[direct]
-        signal = pd.DataFrame({"row": rows[o], "debtor": d, "signal": IBAN,
-                               "score": WEIGHTS[IBAN] / n_d[o], "strong": (n_d[o] == 1) & ~conflict[o]})
+        # Candidats : débiteurs de l'IBAN, sauf IBAN partagé par trop de débiteurs.
+        emit = np.flatnonzero((sub == DEBTOR_DIRECT) & (nd <= self.cfg.signals.iban.max_debtors_per_iban))
+        counts = nd[emit]
+        total = int(counts.sum())
+        if total == 0:
+            return _empty_signal(), route
+        d_start = np.searchsorted(d_owner, np.arange(len(uib)))            # d_owner trié (gather)
+        e = np.repeat(emit, counts)
+        idx = np.repeat(d_start[u_of[emit]] - (np.cumsum(counts) - counts), counts) + np.arange(total)
+        signal = pd.DataFrame({"row": rows[e], "debtor": d_pos[idx], "signal": IBAN,
+                               "score": WEIGHTS[IBAN] / nd[e], "strong": (nd[e] == 1) & ~conflict[u_of[e]]})
         return signal, route
 
     def _name(self, pos: np.ndarray, as_of) -> pd.DataFrame:
@@ -353,6 +366,40 @@ class Allocator:
         out[hits["i"].to_numpy()] = True
         return out
 
+    def _client_file_pairs(self, pos: np.ndarray, free: np.ndarray, available: np.ndarray,
+                           date_tolerance: int) -> pd.DataFrame:
+        """Couples (ligne, fichier) de même montant corroborés par la date, l'IBAN ou la référence.
+
+        Les fichiers non rattachés s'accumulent et les montants ronds sont fréquents : les couples sont
+        développés par paquets de lignes d'au plus ~`CF_PAIR_BUDGET` couples, filtrés aussitôt.
+        """
+        amount = self._cf_amount[available]
+        ok = amount >= 0
+        order = np.argsort(amount[ok], kind="stable")
+        files, amounts = available[ok][order], amount[ok][order]
+        pay_amount = self._pay_amount[pos[free]]
+        lo = np.searchsorted(amounts, pay_amount, side="left")
+        count = np.searchsorted(amounts, pay_amount, side="right") - lo
+        block = (np.cumsum(count) - count) // CF_PAIR_BUDGET
+        kept_r, kept_f = [np.array([], dtype=np.int64)], [np.array([], dtype=np.int64)]
+        for b in np.unique(block[count > 0]):
+            idx = np.flatnonzero((block == b) & (count > 0))
+            c = count[idx]
+            total = int(c.sum())
+            r = np.repeat(free[idx], c)
+            f = files[np.repeat(lo[idx] - (np.cumsum(c) - c), c) + np.arange(total)]
+            p = pos[r]
+            keep = np.abs(self._cf_day[f] - self._pay_value_day[p]) <= date_tolerance
+            if self._cf_iban is not None:
+                keep |= (self._cf_iban[f] >= 0) & (self._cf_iban[f] == self._pay_iban[p])
+            rest = np.flatnonzero(~keep)                  # référence cherchée seulement si nécessaire
+            keep[rest] = np.fromiter((bool(c_) and c_ in lbl for c_, lbl in
+                                      zip(self._cf_ref[f[rest]], self._pay_label[p[rest]])),
+                                     dtype=bool, count=len(rest))
+            kept_r.append(r[keep])
+            kept_f.append(f[keep])
+        return pd.DataFrame({"r": np.concatenate(kept_r), "f": np.concatenate(kept_f)})
+
     def _client_file(self, pos: np.ndarray, as_of) -> tuple[pd.DataFrame, np.ndarray]:
         """Rattache les client files reçus aux paiements, puis en déduit les débiteurs cités."""
         cfg = self.cfg.signals.client_file
@@ -361,18 +408,8 @@ class Allocator:
         received = self.state.client_files_received_at(as_of)
         available = received[~np.isin(received, np.fromiter(self._consumed, np.int64, len(self._consumed)))]
         if len(free) and len(available):
-            files = pd.DataFrame({"f": available, "amount": self._cf_amount[available]})
-            pays = pd.DataFrame({"r": free, "amount": self._pay_amount[pos[free]]})
-            pairs = pays.merge(files[files["amount"] >= 0], on="amount")
+            pairs = self._client_file_pairs(pos, free, available, cfg.date_tolerance_days)
             if len(pairs):
-                r, f = pairs["r"].to_numpy(), pairs["f"].to_numpy()
-                p = pos[r]
-                date_ok = np.abs(self._cf_day[f] - self._pay_value_day[p]) <= cfg.date_tolerance_days
-                iban_ok = (self._cf_iban[f] >= 0) & (self._cf_iban[f] == self._pay_iban[p]) \
-                    if self._cf_iban is not None else np.zeros(len(f), bool)
-                ref_ok = np.fromiter((bool(c) and c in lbl for c, lbl in zip(self._cf_ref[f], self._pay_label[p])),
-                                     dtype=bool, count=len(f))
-                pairs = pairs[date_ok | iban_ok | ref_ok]
                 # Sans ambiguïté : un seul fichier pour le paiement, un seul paiement pour le fichier.
                 pairs = pairs[~pairs.duplicated("r", keep=False) & ~pairs.duplicated("f", keep=False)]
                 for r_i, f_i in zip(pairs["r"].to_numpy(), pairs["f"].to_numpy()):

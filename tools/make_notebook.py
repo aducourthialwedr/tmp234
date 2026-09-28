@@ -70,6 +70,7 @@ import src.reconcile_ml.pipeline as _pipeline
 
 _allocation.CHUNK_ROWS = 20_000                 # paiements par bloc d'allocation
 _allocation.NAME_PAIR_BUDGET = 2_000_000        # paires (paiement, débiteur) du signal « nom » par paquet
+_allocation.CF_PAIR_BUDGET = 2_000_000          # couples (paiement, client file de même montant) par paquet
 _features.CANDIDATE_PAIR_BUDGET = 2_000_000     # paires (paiement, facture) examinées par bloc de candidats ML
 _pipeline.FEATURE_BLOCK_PAIRS = 500_000         # paires par bloc de calcul des features"""),
     ("md", "## Paramètres\n\nLecture et modification des paramètres depuis le notebook (écrits dans `config/settings.yaml`)."),

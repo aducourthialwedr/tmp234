@@ -82,6 +82,9 @@ class ReferenceSignal(_Model):
 class IbanSignal(_Model):
     enabled: bool = Field(True, description="Routage IBAN (DEBTOR_DIRECT / ASSIGNOR / TECHNICAL_ACCOUNT / "
                           "UNKNOWN) arbitré par bankroll_code.")
+    max_debtors_per_iban: int = Field(20, ge=1, description="Un IBAN rattaché à plus de débiteurs (connus à D) "
+                                      "ne propose aucun candidat : compte de centralisation ou IBAN générique. "
+                                      "Le routage reste calculé.")
 
 
 class NameSignal(_Model):

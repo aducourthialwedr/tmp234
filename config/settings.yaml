@@ -63,6 +63,9 @@ allocation:
       # Routage IBAN (DEBTOR_DIRECT / ASSIGNOR / TECHNICAL_ACCOUNT / UNKNOWN) arbitré par
       # bankroll_code.
       enabled: true
+      # Un IBAN rattaché à plus de débiteurs (connus à D) ne propose aucun candidat : compte de
+      # centralisation ou IBAN générique. Le routage reste calculé.
+      max_debtors_per_iban: 20
     # Signal 4.
     name:
       # Similarité entre le libellé et le nom du débiteur (index inversé).

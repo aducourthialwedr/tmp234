@@ -412,6 +412,12 @@ tenues dans le code :
 - **Colonnes de listes.** À la relecture de l'étape 1 (`src/load/interim.py`), les clés de référence et
   les nombres des libellés restent en Arrow, soit ~8 fois moins qu'en listes Python. Les colonnes
   inutilisées ne sont pas relues.
+- **IBAN.** Le travail se fait par IBAN distinct. Un IBAN porté par plus de
+  `allocation.signals.iban.max_debtors_per_iban` débiteurs (20 par défaut : compte de centralisation,
+  IBAN générique) garde son routage mais ne propose pas de candidats. **C'est le seul réglage qui
+  change le résultat.**
+- **Client files.** Les fichiers non rattachés s'accumulent. Les couples (paiement, fichier de même
+  montant) sont développés par paquets de `CF_PAIR_BUDGET` et filtrés aussitôt.
 - **Signal « nom ».** Les paiements sont traités par paquets de `NAME_PAIR_BUDGET` paires (paiement,
   débiteur portant un mot du libellé).
 - **Vocabulaires.** Les références, les mots de nom et les IBAN sont stockés sous forme d'empreintes
