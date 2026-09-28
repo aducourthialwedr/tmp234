@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INCLUDE = ["src", "config", "notebooks", ".streamlit", "pyproject.toml", "requirements.txt", "README.md",
-           "GUIDE.md", "CLAUDE.md", "spec_rapprochement_automatique.md"]
+           "GUIDE.md", "RESULTATS.md", "CLAUDE.md", "spec_rapprochement_automatique.md"]
 EXCLUDED_PARTS = {"__pycache__", ".pytest_cache", ".ipynb_checkpoints"}
 EMPTY_DIRS = ["data", "reports", "models"]
 

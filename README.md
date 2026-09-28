@@ -5,7 +5,7 @@ aux factures qu'il règle, par des règles déterministes puis un modèle de sco
 de **taux d'automatisation à précision ≥ 99,5 %**. Tout est rejoué jour par jour, sans fuite
 d'information future : un seul code sert au backtest et à la production.
 
-**Pour comprendre le projet et ses subtilités : [`GUIDE.md`](GUIDE.md).** Le brief est dans `CLAUDE.md`, la spécification détaillée dans `spec_rapprochement_automatique.md`.
+**Pour comprendre le projet et ses subtilités : [`GUIDE.md`](GUIDE.md).** **Pour lire les résultats (rapports, métriques, dénominateurs) : [`RESULTATS.md`](RESULTATS.md).** Le brief est dans `CLAUDE.md`, la spécification détaillée dans `spec_rapprochement_automatique.md`.
 
 ## Installation
 

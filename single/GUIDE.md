@@ -4,6 +4,7 @@ Ce guide explique comment le moteur fonctionne, pourquoi il est construit ainsi,
 **subtilités** qui ne se voient pas en lisant le code en diagonale. Il complète :
 
 - `README.md` : installation et utilisation rapide ;
+- `RESULTATS.md` : comment chaque rapport et chaque métrique sont calculés, et comment les lire ;
 - `CLAUDE.md` : le brief (choix du POC, ordre des étapes) ;
 - `spec_rapprochement_automatique.md` : la spécification détaillée (features, formules).
 
