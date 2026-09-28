@@ -42,6 +42,8 @@ WEIGHTS = {CLIENT_FILE: 1.0, REFERENCE: 0.95, IBAN: 0.9, NAME: 0.7, AMOUNT: 0.5}
 
 # Taille des blocs de paiements traités ensemble : borne la mémoire des jointures d'une journée.
 CHUNK_ROWS = 20_000
+# Paires (paiement, débiteur portant un mot du libellé) examinées ensemble par le signal « nom ».
+NAME_PAIR_BUDGET = 2_000_000
 
 _SIGNAL_COLUMNS = ["row", "debtor", "signal", "score", "strong"]
 _SIGNAL_CODE = {s: i for i, s in enumerate(SIGNALS)}
@@ -222,13 +224,24 @@ class Allocator:
         idf = np.where(usable, np.log1p(n_known / np.maximum(df, 1)), 0.0)
         keep = usable[t_owner]
         postings = pd.DataFrame({"t": t_owner[keep], "debtor": t_deb[keep]})
-        matched = (pd.DataFrame({"row": row, "t": t_of_row}).drop_duplicates()
-                   .merge(postings, on="t"))
-        if matched.empty:
+        asked = pd.DataFrame({"row": row, "t": t_of_row}).drop_duplicates()
+        # (paiement, terme) × débiteurs du terme : jusqu'à `max_debtors_per_term` lignes par terme. Les
+        # paiements sont traités par paquets dont le nombre de paires reste sous `NAME_PAIR_BUDGET`.
+        load = np.bincount(asked["row"].to_numpy(), weights=np.where(usable, df, 0)[asked["t"].to_numpy()],
+                           minlength=len(pos))
+        block = (np.cumsum(load) - load) // NAME_PAIR_BUDGET
+        scores = []
+        for b in np.unique(block[asked["row"].to_numpy()]) if len(asked) else []:
+            part = asked[block[asked["row"].to_numpy()] == b].merge(postings, on="t")
+            if part.empty:
+                continue
+            part["idf"] = idf[part["t"].to_numpy()]
+            part["spec"] = 1.0 / np.maximum(df[part["t"].to_numpy()], 1)
+            scores.append(part.groupby(["row", "debtor"], as_index=False).agg(idf=("idf", "sum"),
+                                                                             spec=("spec", "max")))
+        if not scores:
             return _empty_signal()
-        matched["idf"] = idf[matched["t"].to_numpy()]
-        matched["spec"] = 1.0 / np.maximum(df[matched["t"].to_numpy()], 1)
-        score = matched.groupby(["row", "debtor"], as_index=False).agg(idf=("idf", "sum"), spec=("spec", "max"))
+        score = pd.concat(scores, ignore_index=True)
 
         # Dénominateur : poids de tous les termes (utilisables à D) du nom de chaque débiteur candidat.
         cand = np.unique(score["debtor"].to_numpy())
@@ -333,7 +346,9 @@ class Allocator:
         udeb, d_of = np.unique(debtors, return_inverse=True)
         d_owner, d_term = self.names.debtor_terms.gather(udeb)
         deb_terms = pd.DataFrame({"debtor": udeb[d_owner], "term": d_term})
-        hits = pairs.merge(pay_terms, on="row").merge(deb_terms, on=["debtor", "term"])
+        # Mots du nom du débiteur (quelques-uns) d'abord, puis présence dans le libellé : pas de produit
+        # (couple × tous les mots du libellé).
+        hits = pairs.merge(deb_terms, on="debtor").merge(pay_terms.drop_duplicates(), on=["row", "term"])
         out = np.zeros(len(rows), dtype=bool)
         out[hits["i"].to_numpy()] = True
         return out

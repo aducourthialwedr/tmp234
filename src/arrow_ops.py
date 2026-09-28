@@ -42,3 +42,44 @@ def lookup(keys: pd.Series, index_keys: pd.Series, values: pd.Series) -> pd.Seri
     out = out.reset_index(drop=True).where(found)
     out.index = keys.index
     return out
+
+
+# --- Colonnes de listes -----------------------------------------------------------------------------
+# Les colonnes de listes (clés de référence, nombres des libellés) sont relues en Arrow : quelques
+# octets par élément au lieu d'une liste Python et d'un objet chaîne par élément (÷ 8 environ). Les
+# fonctions ci-dessous acceptent les deux formes (Arrow ou listes Python, comme dans les tests).
+
+def _list_array(values: pd.Series) -> pa.Array | None:
+    """Tableau Arrow de listes si la colonne est en Arrow, sinon None."""
+    if isinstance(values, pd.Series) and isinstance(values.dtype, pd.ArrowDtype):
+        arr = values.array._pa_array
+        return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+    return None
+
+
+def list_lengths(values: pd.Series) -> np.ndarray:
+    """Longueur de chaque liste (0 si nulle)."""
+    arr = _list_array(values)
+    if arr is not None:
+        return pc.list_value_length(arr).fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+    return np.fromiter((0 if v is None or isinstance(v, float) else len(v) for v in values),
+                       dtype=np.int64, count=len(values))
+
+
+def flatten_lists(values: pd.Series) -> tuple[np.ndarray, np.ndarray] | None:
+    """(longueurs, valeurs aplaties en objets) pour une colonne Arrow ; None si listes Python."""
+    arr = _list_array(values)
+    if arr is None:
+        return None
+    lengths = pc.list_value_length(arr).fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+    flat = pc.list_flatten(arr).to_numpy(zero_copy_only=False).astype(object)
+    return lengths, flat
+
+
+def list_take(values: pd.Series, positions: np.ndarray) -> list:
+    """Listes Python des lignes demandées (pour un petit nombre de lignes)."""
+    arr = _list_array(values)
+    if arr is not None:
+        return [v or [] for v in arr.take(pa.array(np.asarray(positions, dtype=np.int64))).to_pylist()]
+    col = values.to_numpy()
+    return [col[p] if isinstance(col[p], (list, tuple, np.ndarray)) else [] for p in positions]

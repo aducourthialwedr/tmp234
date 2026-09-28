@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from src.arrow_ops import list_take
 from src.load.events import EVENT_RANK, EventType
 from src.load.loader import LoadedData
 
@@ -245,9 +246,9 @@ class LedgerState:
         delay = (self._pay_value_day[pay] - self._inv_due_day[inv]).astype(np.float64)
         has_delay = np.abs(delay) < 1e6
         delay = np.where(has_delay, delay, 0.0)
-        pay_numbers = self._pay["label_numbers"].to_numpy()
-        inv_keys = self._inv["client_reference_keys"].to_numpy()
-        cited = np.fromiter((bool(set(pay_numbers[p]) & set(inv_keys[i])) for p, i in zip(pay, inv)),
+        pay_numbers = list_take(self._pay["label_numbers"], pay)
+        inv_keys = list_take(self._inv["client_reference_keys"], inv)
+        cited = np.fromiter((bool(set(n) & set(k)) for n, k in zip(pay_numbers, inv_keys)),
                             dtype=bool, count=len(pay))
         values = np.zeros((len(lines), _N_WIN))
         values[:, _W_PAYMENTS] = first_of_pay

@@ -15,9 +15,14 @@ from itertools import chain
 import numpy as np
 import pandas as pd
 
+from src.arrow_ops import flatten_lists
+
 
 def _flatten(values: pd.Series | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Colonne de listes → (longueurs, valeurs aplaties en objets)."""
+    arrow = flatten_lists(values) if isinstance(values, pd.Series) else None
+    if arrow is not None:
+        return arrow
     arr = values.to_numpy() if isinstance(values, pd.Series) else values
     lengths = np.fromiter((0 if v is None or (isinstance(v, float)) else len(v) for v in arr),
                           dtype=np.int64, count=len(arr))
@@ -67,6 +72,10 @@ class Postings:
         return owner, self.values[starts + np.arange(total)]
 
 
+def _str_lengths(values: np.ndarray) -> np.ndarray:
+    return np.fromiter((len(v) for v in values), dtype=np.int64, count=len(values))
+
+
 def _hash(values: np.ndarray) -> np.ndarray:
     """Empreintes 64 bits déterministes de chaînes (valeurs nulles : 0, jamais dans un vocabulaire)."""
     values = np.asarray(values, dtype=object)
@@ -86,12 +95,24 @@ class Vocabulary:
     def __init__(self, values: np.ndarray):
         values = np.asarray(values, dtype=object)
         valid = ~pd.isna(values)
-        hashes = _hash(values[valid])
+        kept = values[valid]
+        self._build(_hash(kept), _str_lengths(kept))
+        codes = np.full(len(values), -1, dtype=np.int64)
+        codes[valid] = self.codes
+        self.codes = codes
+
+    @classmethod
+    def from_hashes(cls, hashes: np.ndarray, lengths: np.ndarray) -> Vocabulary:
+        """Vocabulaire construit à partir d'empreintes déjà calculées (par blocs) ; `codes` : identifiant
+        de chaque empreinte fournie."""
+        vocab = cls.__new__(cls)
+        vocab._build(hashes, lengths)
+        return vocab
+
+    def _build(self, hashes: np.ndarray, lengths: np.ndarray) -> None:
         self.hashes, first, inverse = np.unique(hashes, return_index=True, return_inverse=True)
-        self.codes = np.full(len(values), -1, dtype=np.int64)
-        self.codes[valid] = inverse
-        kept = values[valid][first]
-        self.lengths = np.fromiter((len(v) for v in kept), dtype=np.int64, count=len(kept))
+        self.codes = inverse.astype(np.int64).ravel()
+        self.lengths = np.asarray(lengths, dtype=np.int64)[first]
 
     def __len__(self) -> int:
         return len(self.hashes)
@@ -112,13 +133,13 @@ class Vocabulary:
         return out
 
 
-# Les listes de clés / termes des libellés sont traduites par blocs : pas de copie en objets Python
-# de tous les libellés de l'historique à la fois.
+# Les colonnes de listes (clés des factures, nombres et termes des libellés) sont traduites par blocs
+# de lignes : jamais de copie en objets Python de toute la colonne à la fois.
 _PAYMENT_CHUNK = 200_000
 
 
-def _payment_postings(n: int, ids_of_chunk) -> Postings:
-    """Paiement → identifiants, construits par blocs de `_PAYMENT_CHUNK` paiements.
+def chunked_postings(n: int, ids_of_chunk) -> Postings:
+    """Ligne → identifiants, construits par blocs de `_PAYMENT_CHUNK` lignes.
 
     `ids_of_chunk(start, end)` rend (propriétaire relatif au bloc, identifiant) ; −1 = hors vocabulaire.
     """
@@ -135,21 +156,28 @@ class ReferenceIndex:
     """Clé de référence → factures ; paiement → clés de son libellé."""
 
     def __init__(self, invoices: pd.DataFrame, payments: pd.DataFrame):
-        parts = []
+        hashes, lengths, owners = [np.array([], dtype=np.uint64)], [np.array([], dtype=np.int64)], \
+            [np.array([], dtype=np.int64)]
         for col in ("client_reference_keys", "internal_reference_keys"):
-            lengths, flat = _flatten(invoices[col])
-            parts.append((np.repeat(np.arange(len(invoices)), lengths), flat))
-        inv_pos = np.concatenate([p[0] for p in parts])
-        flat = np.concatenate([p[1] for p in parts])
-        self.vocab = Vocabulary(flat)
-        self.key_invoices = Postings.build(self.vocab.codes, inv_pos, len(self.vocab))
+            column = invoices[col]
+            for start in range(0, len(invoices), _PAYMENT_CHUNK):
+                end = min(start + _PAYMENT_CHUNK, len(invoices))
+                n, flat = _flatten(column.iloc[start:end])
+                valid = ~pd.isna(flat)
+                flat = flat[valid]
+                hashes.append(_hash(flat))
+                lengths.append(_str_lengths(flat))
+                owners.append(np.repeat(np.arange(start, end), n)[valid])
+        self.vocab = Vocabulary.from_hashes(np.concatenate(hashes), np.concatenate(lengths))
+        self.key_invoices = Postings.build(self.vocab.codes, np.concatenate(owners), len(self.vocab))
+        self.vocab.codes = None                 # identifiants par occurrence : inutiles une fois l'index bâti
         numbers = payments["label_numbers"]
 
         def keys_of(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
             lengths, flat = _flatten(numbers.iloc[start:end])
             return np.repeat(np.arange(end - start), lengths), self.vocab.lookup(flat)
 
-        self.payment_keys = _payment_postings(len(payments), keys_of)
+        self.payment_keys = chunked_postings(len(payments), keys_of)
 
     def key_ids(self, keys) -> np.ndarray:
         return self.vocab.lookup(np.asarray(list(keys), dtype=object))
@@ -193,7 +221,7 @@ class NameIndex:
             o, t = terms_by_owner(labels.iloc[start:end].reset_index(drop=True), min_length)
             return o, self.vocab.lookup(t)
 
-        self.payment_terms = _payment_postings(len(payments), terms_of)
+        self.payment_terms = chunked_postings(len(payments), terms_of)
 
 
 def party_ibans(debtors: pd.DataFrame, assignors: pd.DataFrame, party_iban: pd.DataFrame | None) -> pd.DataFrame:

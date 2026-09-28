@@ -27,6 +27,7 @@ import pandas as pd
 import pickle
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import re
 import sys
 import textwrap
@@ -505,6 +506,47 @@ def lookup(keys: pd.Series, index_keys: pd.Series, values: pd.Series) -> pd.Seri
     out = out.reset_index(drop=True).where(found)
     out.index = keys.index
     return out
+
+
+# --- Colonnes de listes -----------------------------------------------------------------------------
+# Les colonnes de listes (clés de référence, nombres des libellés) sont relues en Arrow : quelques
+# octets par élément au lieu d'une liste Python et d'un objet chaîne par élément (÷ 8 environ). Les
+# fonctions ci-dessous acceptent les deux formes (Arrow ou listes Python, comme dans les tests).
+
+def _list_array(values: pd.Series) -> pa.Array | None:
+    """Tableau Arrow de listes si la colonne est en Arrow, sinon None."""
+    if isinstance(values, pd.Series) and isinstance(values.dtype, pd.ArrowDtype):
+        arr = values.array._pa_array
+        return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+    return None
+
+
+def list_lengths(values: pd.Series) -> np.ndarray:
+    """Longueur de chaque liste (0 si nulle)."""
+    arr = _list_array(values)
+    if arr is not None:
+        return pc.list_value_length(arr).fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+    return np.fromiter((0 if v is None or isinstance(v, float) else len(v) for v in values),
+                       dtype=np.int64, count=len(values))
+
+
+def flatten_lists(values: pd.Series) -> tuple[np.ndarray, np.ndarray] | None:
+    """(longueurs, valeurs aplaties en objets) pour une colonne Arrow ; None si listes Python."""
+    arr = _list_array(values)
+    if arr is None:
+        return None
+    lengths = pc.list_value_length(arr).fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+    flat = pc.list_flatten(arr).to_numpy(zero_copy_only=False).astype(object)
+    return lengths, flat
+
+
+def list_take(values: pd.Series, positions: np.ndarray) -> list:
+    """Listes Python des lignes demandées (pour un petit nombre de lignes)."""
+    arr = _list_array(values)
+    if arr is not None:
+        return [v or [] for v in arr.take(pa.array(np.asarray(positions, dtype=np.int64))).to_pylist()]
+    col = values.to_numpy()
+    return [col[p] if isinstance(col[p], (list, tuple, np.ndarray)) else [] for p in positions]
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1947,12 +1989,39 @@ def write_reports(profile: dict[str, pd.DataFrame], meta: dict[str, Any], report
 
 
 
+# Colonnes produites au chargement mais lues par aucune étape suivante : pas relues (mémoire).
+UNUSED_COLUMNS = {
+    "payment": {"label_tokens"},
+    "client_file": {"payment_reference_tokens", "payment_reference_numbers"},
+    "debtor": {"name_tokens"},
+    "assignor": {"name_tokens"},
+}
+# Tables dont les colonnes de listes restent en Arrow (les parties, petites, gardent des listes Python).
+ARROW_LIST_TABLES = {"payment", "invoice", "client_file", "client_file_line"}
+
 
 class InterimError(RuntimeError):
     pass
 
 
-def load_interim(directory: str | Path, verify: bool = True) -> tuple[LoadedData, pd.DataFrame, dict]:
+def read_table(path: Path, name: str, lean: bool = True) -> pd.DataFrame:
+    """Une table de l'étape 1. `lean` : colonnes inutilisées écartées, colonnes de listes en Arrow
+    (quelques octets par élément au lieu d'un objet Python par élément)."""
+    if not lean:
+        return pd.read_parquet(path)
+    schema = pq.read_schema(path)
+    columns = [f.name for f in schema if f.name not in UNUSED_COLUMNS.get(name, set())]
+    lists = [f.name for f in schema if f.name in columns and name in ARROW_LIST_TABLES
+             and (pa.types.is_list(f.type) or pa.types.is_large_list(f.type))]
+    df = pd.read_parquet(path, columns=[c for c in columns if c not in lists])
+    if lists:
+        table = pq.read_table(path, columns=lists)
+        for c in lists:
+            df[c] = pd.Series(pd.arrays.ArrowExtensionArray(table.column(c)), index=df.index)
+    return df[columns]
+
+
+def load_interim(directory: str | Path, verify: bool = True, lean: bool = True) -> tuple[LoadedData, pd.DataFrame, dict]:
     """Tables, journal et métadonnées de l'étape 1. Vérifie l'empreinte du journal si `verify`."""
     d = Path(directory)
     meta_path = d / "journal_meta.json"
@@ -1960,7 +2029,7 @@ def load_interim(directory: str | Path, verify: bool = True) -> tuple[LoadedData
         raise InterimError(f"aucune sortie de l'étape 1 dans {d} : lancer d'abord le chargement")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     names = [*TABLES, "party_iban"]
-    tables = {name: pd.read_parquet(d / f"{name}.parquet") for name in names if (d / f"{name}.parquet").exists()}
+    tables = {name: read_table(d / f"{name}.parquet", name, lean) for name in names if (d / f"{name}.parquet").exists()}
     journal = pd.read_parquet(d / "journal.parquet")
     if verify and journal_hash(journal) != meta["journal_sha256"]:
         raise InterimError("le journal ne correspond pas à son empreinte : relancer l'étape 1")
@@ -2844,9 +2913,9 @@ class LedgerState:
         delay = (self._pay_value_day[pay] - self._inv_due_day[inv]).astype(np.float64)
         has_delay = np.abs(delay) < 1e6
         delay = np.where(has_delay, delay, 0.0)
-        pay_numbers = self._pay["label_numbers"].to_numpy()
-        inv_keys = self._inv["client_reference_keys"].to_numpy()
-        cited = np.fromiter((bool(set(pay_numbers[p]) & set(inv_keys[i])) for p, i in zip(pay, inv)),
+        pay_numbers = list_take(self._pay["label_numbers"], pay)
+        inv_keys = list_take(self._inv["client_reference_keys"], inv)
+        cited = np.fromiter((bool(set(n) & set(k)) for n, k in zip(pay_numbers, inv_keys)),
                             dtype=bool, count=len(pay))
         values = np.zeros((len(lines), _N_WIN))
         values[:, _W_PAYMENTS] = first_of_pay
@@ -3358,8 +3427,12 @@ Aucune recherche ne parcourt tous les débiteurs : on part toujours du paiement.
 
 
 
+
 def _flatten(values: pd.Series | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Colonne de listes → (longueurs, valeurs aplaties en objets)."""
+    arrow = flatten_lists(values) if isinstance(values, pd.Series) else None
+    if arrow is not None:
+        return arrow
     arr = values.to_numpy() if isinstance(values, pd.Series) else values
     lengths = np.fromiter((0 if v is None or (isinstance(v, float)) else len(v) for v in arr),
                           dtype=np.int64, count=len(arr))
@@ -3409,6 +3482,10 @@ class Postings:
         return owner, self.values[starts + np.arange(total)]
 
 
+def _str_lengths(values: np.ndarray) -> np.ndarray:
+    return np.fromiter((len(v) for v in values), dtype=np.int64, count=len(values))
+
+
 def _hash(values: np.ndarray) -> np.ndarray:
     """Empreintes 64 bits déterministes de chaînes (valeurs nulles : 0, jamais dans un vocabulaire)."""
     values = np.asarray(values, dtype=object)
@@ -3428,12 +3505,24 @@ class Vocabulary:
     def __init__(self, values: np.ndarray):
         values = np.asarray(values, dtype=object)
         valid = ~pd.isna(values)
-        hashes = _hash(values[valid])
+        kept = values[valid]
+        self._build(_hash(kept), _str_lengths(kept))
+        codes = np.full(len(values), -1, dtype=np.int64)
+        codes[valid] = self.codes
+        self.codes = codes
+
+    @classmethod
+    def from_hashes(cls, hashes: np.ndarray, lengths: np.ndarray) -> Vocabulary:
+        """Vocabulaire construit à partir d'empreintes déjà calculées (par blocs) ; `codes` : identifiant
+        de chaque empreinte fournie."""
+        vocab = cls.__new__(cls)
+        vocab._build(hashes, lengths)
+        return vocab
+
+    def _build(self, hashes: np.ndarray, lengths: np.ndarray) -> None:
         self.hashes, first, inverse = np.unique(hashes, return_index=True, return_inverse=True)
-        self.codes = np.full(len(values), -1, dtype=np.int64)
-        self.codes[valid] = inverse
-        kept = values[valid][first]
-        self.lengths = np.fromiter((len(v) for v in kept), dtype=np.int64, count=len(kept))
+        self.codes = inverse.astype(np.int64).ravel()
+        self.lengths = np.asarray(lengths, dtype=np.int64)[first]
 
     def __len__(self) -> int:
         return len(self.hashes)
@@ -3454,13 +3543,13 @@ class Vocabulary:
         return out
 
 
-# Les listes de clés / termes des libellés sont traduites par blocs : pas de copie en objets Python
-# de tous les libellés de l'historique à la fois.
+# Les colonnes de listes (clés des factures, nombres et termes des libellés) sont traduites par blocs
+# de lignes : jamais de copie en objets Python de toute la colonne à la fois.
 _PAYMENT_CHUNK = 200_000
 
 
-def _payment_postings(n: int, ids_of_chunk) -> Postings:
-    """Paiement → identifiants, construits par blocs de `_PAYMENT_CHUNK` paiements.
+def chunked_postings(n: int, ids_of_chunk) -> Postings:
+    """Ligne → identifiants, construits par blocs de `_PAYMENT_CHUNK` lignes.
 
     `ids_of_chunk(start, end)` rend (propriétaire relatif au bloc, identifiant) ; −1 = hors vocabulaire.
     """
@@ -3477,21 +3566,28 @@ class ReferenceIndex:
     """Clé de référence → factures ; paiement → clés de son libellé."""
 
     def __init__(self, invoices: pd.DataFrame, payments: pd.DataFrame):
-        parts = []
+        hashes, lengths, owners = [np.array([], dtype=np.uint64)], [np.array([], dtype=np.int64)], \
+            [np.array([], dtype=np.int64)]
         for col in ("client_reference_keys", "internal_reference_keys"):
-            lengths, flat = _flatten(invoices[col])
-            parts.append((np.repeat(np.arange(len(invoices)), lengths), flat))
-        inv_pos = np.concatenate([p[0] for p in parts])
-        flat = np.concatenate([p[1] for p in parts])
-        self.vocab = Vocabulary(flat)
-        self.key_invoices = Postings.build(self.vocab.codes, inv_pos, len(self.vocab))
+            column = invoices[col]
+            for start in range(0, len(invoices), _PAYMENT_CHUNK):
+                end = min(start + _PAYMENT_CHUNK, len(invoices))
+                n, flat = _flatten(column.iloc[start:end])
+                valid = ~pd.isna(flat)
+                flat = flat[valid]
+                hashes.append(_hash(flat))
+                lengths.append(_str_lengths(flat))
+                owners.append(np.repeat(np.arange(start, end), n)[valid])
+        self.vocab = Vocabulary.from_hashes(np.concatenate(hashes), np.concatenate(lengths))
+        self.key_invoices = Postings.build(self.vocab.codes, np.concatenate(owners), len(self.vocab))
+        self.vocab.codes = None                 # identifiants par occurrence : inutiles une fois l'index bâti
         numbers = payments["label_numbers"]
 
         def keys_of(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
             lengths, flat = _flatten(numbers.iloc[start:end])
             return np.repeat(np.arange(end - start), lengths), self.vocab.lookup(flat)
 
-        self.payment_keys = _payment_postings(len(payments), keys_of)
+        self.payment_keys = chunked_postings(len(payments), keys_of)
 
     def key_ids(self, keys) -> np.ndarray:
         return self.vocab.lookup(np.asarray(list(keys), dtype=object))
@@ -3535,7 +3631,7 @@ class NameIndex:
             o, t = terms_by_owner(labels.iloc[start:end].reset_index(drop=True), min_length)
             return o, self.vocab.lookup(t)
 
-        self.payment_terms = _payment_postings(len(payments), terms_of)
+        self.payment_terms = chunked_postings(len(payments), terms_of)
 
 
 def party_ibans(debtors: pd.DataFrame, assignors: pd.DataFrame, party_iban: pd.DataFrame | None) -> pd.DataFrame:
@@ -3606,6 +3702,8 @@ WEIGHTS = {CLIENT_FILE: 1.0, REFERENCE: 0.95, IBAN: 0.9, NAME: 0.7, AMOUNT: 0.5}
 
 # Taille des blocs de paiements traités ensemble : borne la mémoire des jointures d'une journée.
 CHUNK_ROWS = 20_000
+# Paires (paiement, débiteur portant un mot du libellé) examinées ensemble par le signal « nom ».
+NAME_PAIR_BUDGET = 2_000_000
 
 _SIGNAL_COLUMNS = ["row", "debtor", "signal", "score", "strong"]
 _SIGNAL_CODE = {s: i for i, s in enumerate(SIGNALS)}
@@ -3786,13 +3884,24 @@ class Allocator:
         idf = np.where(usable, np.log1p(n_known / np.maximum(df, 1)), 0.0)
         keep = usable[t_owner]
         postings = pd.DataFrame({"t": t_owner[keep], "debtor": t_deb[keep]})
-        matched = (pd.DataFrame({"row": row, "t": t_of_row}).drop_duplicates()
-                   .merge(postings, on="t"))
-        if matched.empty:
+        asked = pd.DataFrame({"row": row, "t": t_of_row}).drop_duplicates()
+        # (paiement, terme) × débiteurs du terme : jusqu'à `max_debtors_per_term` lignes par terme. Les
+        # paiements sont traités par paquets dont le nombre de paires reste sous `NAME_PAIR_BUDGET`.
+        load = np.bincount(asked["row"].to_numpy(), weights=np.where(usable, df, 0)[asked["t"].to_numpy()],
+                           minlength=len(pos))
+        block = (np.cumsum(load) - load) // NAME_PAIR_BUDGET
+        scores = []
+        for b in np.unique(block[asked["row"].to_numpy()]) if len(asked) else []:
+            part = asked[block[asked["row"].to_numpy()] == b].merge(postings, on="t")
+            if part.empty:
+                continue
+            part["idf"] = idf[part["t"].to_numpy()]
+            part["spec"] = 1.0 / np.maximum(df[part["t"].to_numpy()], 1)
+            scores.append(part.groupby(["row", "debtor"], as_index=False).agg(idf=("idf", "sum"),
+                                                                             spec=("spec", "max")))
+        if not scores:
             return _empty_signal()
-        matched["idf"] = idf[matched["t"].to_numpy()]
-        matched["spec"] = 1.0 / np.maximum(df[matched["t"].to_numpy()], 1)
-        score = matched.groupby(["row", "debtor"], as_index=False).agg(idf=("idf", "sum"), spec=("spec", "max"))
+        score = pd.concat(scores, ignore_index=True)
 
         # Dénominateur : poids de tous les termes (utilisables à D) du nom de chaque débiteur candidat.
         cand = np.unique(score["debtor"].to_numpy())
@@ -3897,7 +4006,9 @@ class Allocator:
         udeb, d_of = np.unique(debtors, return_inverse=True)
         d_owner, d_term = self.names.debtor_terms.gather(udeb)
         deb_terms = pd.DataFrame({"debtor": udeb[d_owner], "term": d_term})
-        hits = pairs.merge(pay_terms, on="row").merge(deb_terms, on=["debtor", "term"])
+        # Mots du nom du débiteur (quelques-uns) d'abord, puis présence dans le libellé : pas de produit
+        # (couple × tous les mots du libellé).
+        hits = pairs.merge(deb_terms, on="debtor").merge(pay_terms.drop_duplicates(), on=["row", "term"])
         out = np.zeros(len(rows), dtype=bool)
         out[hits["i"].to_numpy()] = True
         return out
@@ -5064,7 +5175,7 @@ class Featurizer:
         self.pay_no_alpha = (~labels.str.contains(r"[A-Z]", regex=True)).to_numpy(dtype=np.float32)
         # Nombre de clés du libellé lui-même (et non de celles présentes dans le vocabulaire des références,
         # qui dépend des factures futures).
-        self.pay_n_numbers = pay["label_numbers"].map(len).to_numpy(dtype=np.float32)
+        self.pay_n_numbers = list_lengths(pay["label_numbers"]).astype(np.float32)
         # Facture → clés de sa référence client / de sa référence interne ; clé complète.
         self.inv_client_keys = self._inv_keys(inv["client_reference_keys"])
         self.inv_internal_keys = self._inv_keys(inv["internal_reference_keys"])
@@ -5072,8 +5183,11 @@ class Featurizer:
         self.inv_full_key = self.ref.vocab.lookup(compact.astype(object).to_numpy())
 
     def _inv_keys(self, column: pd.Series) -> Postings:
-        lengths, flat = _flatten(column)
-        return Postings.from_lists(lengths, self.ref.vocab.lookup(flat))
+        def keys_of(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+            lengths, flat = _flatten(column.iloc[start:end])
+            return np.repeat(np.arange(end - start), lengths), self.ref.vocab.lookup(flat)
+
+        return chunked_postings(len(column), keys_of)
 
     # --- Candidats ------------------------------------------------------------------------------------
 

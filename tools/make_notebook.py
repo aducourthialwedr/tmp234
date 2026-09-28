@@ -56,7 +56,10 @@ monitor.live()                                     # pastille mise à jour chaqu
 project = Project(dataset="synthetic", log=monitor.log)"""),
     ("md", """### Réglages mémoire
 
-Ces tailles de blocs bornent la mémoire d'une journée, sans changer les résultats. Il faut les réduire si
+Ces tailles de blocs bornent la mémoire d'une journée, sans changer les résultats. Autre conseil : **redémarrer
+le noyau après l'étape 1** (chargement), puis reprendre à l'étape 2 : la mémoire du chargement n'est pas
+toujours rendue au système. Pour le chargement lui-même, `load.workers` (processus parallèles de
+normalisation) multiplie la mémoire ; le réduire si l'étape 1 est tuée. Il faut les réduire si
 une sous-étape dépasse la limite du pod (au prix d'un peu de temps). D'autres leviers changent les
 résultats :
 - `split.retention_days` : taille du reliquat ;
@@ -66,6 +69,7 @@ import src.reconcile_ml.features as _features
 import src.reconcile_ml.pipeline as _pipeline
 
 _allocation.CHUNK_ROWS = 20_000                 # paiements par bloc d'allocation
+_allocation.NAME_PAIR_BUDGET = 2_000_000        # paires (paiement, débiteur) du signal « nom » par paquet
 _features.CANDIDATE_PAIR_BUDGET = 2_000_000     # paires (paiement, facture) examinées par bloc de candidats ML
 _pipeline.FEATURE_BLOCK_PAIRS = 500_000         # paires par bloc de calcul des features"""),
     ("md", "## Paramètres\n\nLecture et modification des paramètres depuis le notebook (écrits dans `config/settings.yaml`)."),

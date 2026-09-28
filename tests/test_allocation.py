@@ -255,6 +255,7 @@ def test_chunked_allocation_matches_single_pass(monkeypatch):
     import src.allocation.indexes as indexes
     whole = allocate(dataset())
     monkeypatch.setattr(allocator, "CHUNK_ROWS", 3)
+    monkeypatch.setattr(allocator, "NAME_PAIR_BUDGET", 1)
     monkeypatch.setattr(indexes, "_PAYMENT_CHUNK", 2)
     chunked = allocate(dataset())
     pd.testing.assert_frame_equal(whole.payments, chunked.payments)

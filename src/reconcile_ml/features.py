@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 
 from src.allocation.allocator import SIGNALS, Allocation, Allocator
-from src.allocation.indexes import Postings, _flatten
+from src.allocation.indexes import Postings, _flatten, chunked_postings
+from src.arrow_ops import list_lengths
 from src.settings import MLSettings
 from src.timeline.state import LedgerState, _days
 
@@ -116,7 +117,7 @@ class Featurizer:
         self.pay_no_alpha = (~labels.str.contains(r"[A-Z]", regex=True)).to_numpy(dtype=np.float32)
         # Nombre de clés du libellé lui-même (et non de celles présentes dans le vocabulaire des références,
         # qui dépend des factures futures).
-        self.pay_n_numbers = pay["label_numbers"].map(len).to_numpy(dtype=np.float32)
+        self.pay_n_numbers = list_lengths(pay["label_numbers"]).astype(np.float32)
         # Facture → clés de sa référence client / de sa référence interne ; clé complète.
         self.inv_client_keys = self._inv_keys(inv["client_reference_keys"])
         self.inv_internal_keys = self._inv_keys(inv["internal_reference_keys"])
@@ -124,8 +125,11 @@ class Featurizer:
         self.inv_full_key = self.ref.vocab.lookup(compact.astype(object).to_numpy())
 
     def _inv_keys(self, column: pd.Series) -> Postings:
-        lengths, flat = _flatten(column)
-        return Postings.from_lists(lengths, self.ref.vocab.lookup(flat))
+        def keys_of(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+            lengths, flat = _flatten(column.iloc[start:end])
+            return np.repeat(np.arange(end - start), lengths), self.ref.vocab.lookup(flat)
+
+        return chunked_postings(len(column), keys_of)
 
     # --- Candidats ------------------------------------------------------------------------------------
 

@@ -402,6 +402,11 @@ tenues dans le code :
   puis au plus deux factures par (clé ou montant, débiteur), ce qui suffit à établir l'ambiguïté.
 - **Candidats ML.** Le lot est découpé selon un majorant du nombre de paires examinées
   (`CANDIDATE_PAIR_BUDGET`, `src/reconcile_ml/features.py`).
+- **Colonnes de listes.** À la relecture de l'étape 1 (`src/load/interim.py`), les clés de référence et
+  les nombres des libellés restent en Arrow, soit ~8 fois moins qu'en listes Python. Les colonnes
+  inutilisées ne sont pas relues.
+- **Signal « nom ».** Les paiements sont traités par paquets de `NAME_PAIR_BUDGET` paires (paiement,
+  débiteur portant un mot du libellé).
 - **Vocabulaires.** Les références, les mots de nom et les IBAN sont stockés sous forme d'empreintes
   64 bits triées, et non comme des chaînes Python. Les libellés sont traduits par blocs.
 
