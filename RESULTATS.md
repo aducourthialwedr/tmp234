@@ -88,6 +88,7 @@ Tous les rapports sont écrits dans `reports/` (sous-dossier `synthetic/` pour l
 | `backtest(p, m)` | `replay` puis `evaluate` | §4, §6 |
 | `train()` | `models/<jeu>/pair_model/` : `model.json`, `feature_importance.csv`, `calibration_validation.csv` ; jeu dans `data/interim/ml/` | §7 |
 | `report(m, p)` | relit une évaluation déjà calculée, sans recalcul | — |
+| `export_decisions(p, m)` | `decisions_<m>_<p>.parquet` : couples (paiement, facture) proposés et manqués | §6.11 |
 
 ---
 
@@ -317,6 +318,34 @@ Bien calibré : `score_moyen ≈ taux_observé`. Si `taux_observé < score_moyen
 hautes, le modèle est trop confiant. La tranche 0,0–0,1 contient l'immense majorité des paires,
 puisque presque tous les candidats sont faux. Ce tableau ne décide rien : les seuils portent sur le
 score brut et sur des paiements (§7.4).
+
+### 6.11 Export des imputations proposées (`export_decisions`)
+
+`project.export_decisions(p, m)` écrit `reports/decisions_<m>_<p>.parquet` (ou `.csv` avec
+`fmt="csv"`). Code : [src/evaluation/export.py](src/evaluation/export.py). Même périmètre et même
+vérité que l'évaluation.
+
+Une ligne par couple (paiement, facture) **et par type de décision**. Un couple d'abord mis en revue
+puis auto-validé a donc deux lignes. S'y ajoutent les couples **réellement imputés** que le moteur n'a
+pas proposés.
+
+| Colonne | Contenu |
+|---|---|
+| `payment_id`, `invoice_id` | identifiants, tels que dans les sources : clé de jointure avec la table d'imputation d'origine |
+| `statut_paire` | `proposée et réelle`, `proposée non réelle` (facture en trop) ou `réelle non proposée` (facture manquée) |
+| `action`, `step`, `rule_id`, `rule_version` | type de décision (`auto` / `review`), étape (`rules` / `ml`), règle ou type de proposition ML ; vides pour une facture manquée |
+| `montant_propose` | montant imputé proposé sur cette facture, en centimes |
+| `score_premier_jour`, `score_max` | score le premier jour de proposition, et le plus haut. Vaut 1 pour une règle ; score brut du ML sinon |
+| `premier_jour`, `dernier_jour`, `jours_proposee` | jours où le couple a été proposé ; une revue est reproposée chaque jour tant que le paiement reste en attente |
+| `decision_retenue` | le couple fait partie de la décision que l'évaluation retient pour ce paiement (§1.6) |
+| `action_retenue_paiement` | action de cette décision retenue : `auto`, `review` ou `aucune` |
+| `decision_retenue_exacte` | la décision retenue a exactement le bon ensemble de factures ; vide si `aucune` |
+| `arrivee_paiement` | jour d'arrivée du paiement |
+| `paiement_avec_imputation_reelle`, `type_groupe_reel`, `nb_factures_reelles` | vérité du paiement (§1.3) |
+
+Pour retrouver les chiffres de l'évaluation : garder `decision_retenue` et `action == "auto"`, puis
+compter les **paiements** distincts. Leur nombre donne `auto`, et ceux avec `decision_retenue_exacte`
+donnent `auto_corrects`.
 
 ---
 

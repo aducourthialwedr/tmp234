@@ -285,14 +285,11 @@ class Project:
 
     # --- Étape 6 : évaluation -----------------------------------------------------------------------------------------
 
-    def evaluate(self, period: str = "test", matcher: str = "null") -> dict:
-        """Compare les décisions d'un rejeu aux imputations réelles ; écrit les rapports."""
-        from src.evaluation.metrics import by_flag, evaluate, ground_truth, ml_diagnostics
-        from src.evaluation.report import render_markdown
-        settings = self.settings
+    def _replay_outputs(self, period: str, matcher: str):
+        """Contexte et décisions d'un rejeu, vérité et périmètre (paiements arrivés dans la période)."""
+        from src.evaluation.metrics import ground_truth
         tag = f"replay_{matcher}_{period}"
-        replay_dir, rep = self.interim_dir / "replay", self.reports_dir
-        context_path = rep / f"{tag}.json"
+        context_path = self.reports_dir / f"{tag}.json"
         if not context_path.exists():
             raise FileNotFoundError(f"aucun rejeu {matcher}/{period} : lancer d'abord project.replay()")
         context = json.loads(context_path.read_text(encoding="utf-8"))
@@ -306,8 +303,37 @@ class Project:
                            & (journal["ts"] < end)]
         scope = pd.DataFrame({"payment_id": arrivals["entity_id"].to_numpy(),
                               "arrival_day": arrivals["ts"].dt.normalize().to_numpy()})
-        truth = ground_truth(imputation)
-        result = evaluate(pd.read_parquet(replay_dir / f"{tag}_decisions.parquet"), truth, scope,
+        decisions = pd.read_parquet(self.interim_dir / "replay" / f"{tag}_decisions.parquet")
+        return context, decisions, ground_truth(imputation), scope
+
+    def export_decisions(self, period: str = "test", matcher: str = "pipeline", fmt: str = "parquet") -> Path:
+        """Imputations proposées par un rejeu, une ligne par couple (paiement, facture), plus les couples
+        réellement imputés non proposés : à joindre à la table d'imputation d'origine sur
+        (payment_id, invoice_id). Fichier `reports/decisions_<matcher>_<period>.<fmt>` (parquet ou csv)."""
+        from src.evaluation.export import decision_pairs
+        _, decisions, truth, scope = self._replay_outputs(period, matcher)
+        pairs = decision_pairs(decisions, truth, scope)
+        path = self.reports_dir / f"decisions_{matcher}_{period}.{fmt}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if fmt == "csv":
+            pairs.to_csv(path, index=False)
+        elif fmt == "parquet":
+            pairs.to_parquet(path, index=False)
+        else:
+            raise ValueError("fmt : 'parquet' ou 'csv'")
+        counts = pairs["statut_paire"].value_counts().to_dict()
+        self.log(f"  {len(pairs)} couples → {path} ({', '.join(f'{k} : {v}' for k, v in counts.items())})")
+        return path
+
+    def evaluate(self, period: str = "test", matcher: str = "null") -> dict:
+        """Compare les décisions d'un rejeu aux imputations réelles ; écrit les rapports."""
+        from src.evaluation.metrics import by_flag, evaluate, ml_diagnostics
+        from src.evaluation.report import render_markdown
+        settings = self.settings
+        tag = f"replay_{matcher}_{period}"
+        replay_dir, rep = self.interim_dir / "replay", self.reports_dir
+        context, decisions, truth, scope = self._replay_outputs(period, matcher)
+        result = evaluate(decisions, truth, scope,
                           settings.evaluation.target_precision, settings.evaluation.current_automation_rate)
         tables = result.tables()
         if (replay_dir / f"{tag}_proposals.parquet").exists():

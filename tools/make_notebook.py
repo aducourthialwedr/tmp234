@@ -140,6 +140,19 @@ rule = alt.Chart(pd.DataFrame({"y": [target]})).mark_rule(strokeDash=[4, 4]).enc
         display(Markdown(f"**{name}**"))
         display(ev[name])
 display(Markdown((project.reports_dir / "evaluation_pipeline_test.md").read_text(encoding="utf-8")))"""),
+    ("md", """## Export des imputations proposées
+
+Une ligne par couple (paiement, facture) proposé par le moteur, plus les couples réellement imputés qu'il
+n'a pas proposés (`statut_paire`). Le fichier se joint à la table d'imputation d'origine, et à ses
+métadonnées, sur (payment_id, invoice_id). Colonnes détaillées dans `RESULTATS.md`, §6.11."""),
+    ("code", """path = project.export_decisions("test", "pipeline")          # fmt="csv" pour un CSV
+pairs = pd.read_parquet(path)
+display(pairs["statut_paire"].value_counts())
+# Exemple de jointure avec la table d'origine (colonnes réelles : voir config/schema.yaml) :
+# source = pd.read_csv("imputation_source.csv", dtype=str)
+# stats = pairs.merge(source.rename(columns={"<col paiement>": "payment_id", "<col facture>": "invoice_id"}),
+#                     on=["payment_id", "invoice_id"], how="left")
+pairs.head()"""),
     ("md", """## Analyse mémoire
 
 Pic par étape et sous-étape de la dernière session, et courbe dans le temps (limite du pod en rouge).
