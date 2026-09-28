@@ -87,7 +87,11 @@ def trained(tmp_path_factory, synthetic_dir):
     (interim / "journal_meta.json").write_text(json.dumps({"journal_sha256": journal_hash(journal)}))
     settings = Settings.model_validate({"reconcile_ml": {"training": {"payment_sample": 1.0, "num_boost_round": 60}}})
     meta = fit_ml(interim, root / "model", settings, RulesConfig(), log=lambda m: None)
+    trained_dirs[:] = [interim, root]
     return data, settings, PairModel.load(root / "model"), meta
+
+
+trained_dirs: list = []                 # répertoires de l'apprentissage du module (reprise du jeu)
 
 
 def test_fit_produces_versioned_model(trained):
@@ -157,3 +161,18 @@ def test_features_in_blocks_match_single_pass(trained, monkeypatch):
     monkeypatch.setattr(pipeline, "FEATURE_BLOCK_PAIRS", 300)
     blocks, _ = _pipeline_hashes(data, settings, model, start, end)
     assert whole == blocks
+
+
+def test_training_resumes_from_saved_dataset(trained):
+    """Reprise sur le jeu enregistré : pas de rejeu, même modèle ; refus si les réglages changent."""
+    _, settings, model, meta = trained
+    interim, root = trained_dirs
+    logs = []
+    again = fit_ml(interim, root / "model_resumed", settings, RulesConfig(), log=logs.append, reuse_dataset=True)
+    assert again["timings_s"].get("jeu repris") is True
+    assert not any("pour construire le jeu" in line for line in logs)
+    assert again["metrics"]["validation"] == meta["metrics"]["validation"]
+    changed = settings.model_copy(deep=True)
+    changed.reconcile_ml.training.payment_sample = 0.5 if settings.reconcile_ml.training.payment_sample != 0.5 else 0.9
+    with pytest.raises(RuntimeError, match="ne correspond plus"):
+        fit_ml(interim, root / "model_refused", changed, RulesConfig(), log=logs.append, reuse_dataset=True)

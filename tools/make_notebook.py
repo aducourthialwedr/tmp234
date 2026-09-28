@@ -113,8 +113,13 @@ display(rules["by_rule"])"""),
 
 `project.train()` rejoue entraînement + validation, entraîne le modèle et calibre les seuils sur la boucle
 réelle de validation. Après un changement des paramètres de décision (marge δ, précision cible),
-`project.calibrate()` recalcule seulement les seuils, sans réentraîner."""),
-    ("code", """meta = project.train()
+`project.calibrate()` recalcule seulement les seuils, sans réentraîner.
+
+Le jeu d'entraînement (rejeu train + validation, la phase la plus longue) est enregistré dans
+`data/interim/ml/dataset`. Si l'apprentissage est interrompu après sa construction (pendant LightGBM
+ou la calibration des seuils), `project.train(reuse_dataset=True)` repart de ce jeu. La reprise est
+refusée si les données, la featurisation ou les réglages dont il dépend ont changé."""),
+    ("code", """meta = project.train()        # reuse_dataset=True : reprend le jeu déjà construit (run interrompu)
 display(pd.Series(meta["metrics"]["validation"]))
 display(pd.Series(meta["thresholds"]["kinds"], name="τ_high par type"))
 pd.read_csv(project.model_dir / "feature_importance.csv").head(15)"""),

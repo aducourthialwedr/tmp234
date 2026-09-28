@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -318,9 +320,50 @@ def offline_proposals(frame: pd.DataFrame, scores: np.ndarray, settings: Setting
     return props, pd.Series(inv_ids)
 
 
+def dataset_key(journal_sha256: str, settings: Settings, rules: RulesConfig) -> dict:
+    """Ce dont dépend le jeu d'entraînement : journal, featurisation, réglages d'allocation, de périodes,
+    de candidats et de features, règles, échantillonnage. Pas les réglages du modèle ni de la décision."""
+    ml = settings.reconcile_ml
+    return {"journal_sha256": journal_sha256, "featurization_version": FEATURIZATION_VERSION,
+            "settings_fingerprint": fingerprint({
+                "allocation": settings.allocation.model_dump(), "split": settings.split.model_dump(),
+                "candidates": ml.candidates.model_dump(), "features": ml.features.model_dump(),
+                "llm_labels": ml.llm_labels.model_dump(), "payment_sample": ml.training.payment_sample,
+                "rules": rules.model_dump()})}
+
+
+def _saved_dataset(out_dir: Path, key: dict, log: Callable[[str], None]) -> pd.DataFrame | None:
+    """Jeu d'entraînement enregistré par un apprentissage précédent, s'il correspond à `key`."""
+    ds_dir, meta_path = out_dir / "dataset", out_dir / "dataset_meta.json"
+    if not ds_dir.exists():
+        log("  aucun jeu d'entraînement enregistré : reconstruction")
+        return None
+    if meta_path.exists():
+        saved = json.loads(meta_path.read_text(encoding="utf-8"))
+        changed = [k for k in key if saved.get(k) != key[k]]
+        if changed:
+            raise RuntimeError(f"le jeu enregistré ne correspond plus ({', '.join(changed)} : données, "
+                               "featurisation ou réglages modifiés) : relancer train() sans reuse_dataset")
+    else:
+        log("  ⚠ jeu enregistré sans métadonnées (version précédente du code) : réutilisé tel quel. "
+            "À ne faire que si les données et les réglages n'ont pas changé depuis sa construction.")
+    ds = pd.read_parquet(ds_dir)
+    ds["month"] = ds["month"].astype(str)
+    before = len(ds)
+    ds = ds.drop_duplicates(["payment_id", "invoice_id"]).reset_index(drop=True)
+    if len(ds) < before:
+        log(f"  {before - len(ds)} paires en double écartées (écritures successives du jeu)")
+    return ds
+
+
 def fit_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules: RulesConfig,
-           log: Callable[[str], None] = print) -> dict:
-    """Rejoue entraînement + validation, entraîne le modèle, calibre les seuils, sauvegarde."""
+           log: Callable[[str], None] = print, reuse_dataset: bool = False) -> dict:
+    """Rejoue entraînement + validation, entraîne le modèle, calibre les seuils, sauvegarde.
+
+    `reuse_dataset` : reprend le jeu d'entraînement enregistré par un apprentissage précédent (interrompu
+    pendant LightGBM par exemple) au lieu de rejouer train + validation, s'il correspond toujours au
+    journal, à la featurisation et aux réglages dont il dépend.
+    """
     timings = {}
     t = time.perf_counter()
     data, journal, meta = load_interim(interim_dir)
@@ -332,21 +375,30 @@ def fit_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules: RulesC
 
     t = time.perf_counter()
     recorder = DatasetRecorder(state, settings, rules)
-    log(f"… rejeu {train_p.start} → {valid_p.end} pour construire le jeu d'entraînement")
-    run_replay(state, recorder, train_p.start, valid_p.end, settings.split.retention_days,
-               label="jeu d'entraînement (rejeu train + validation)")
-    ds = recorder.dataset()
-    timings["construction du jeu"] = round(time.perf_counter() - t, 1)
-    if ds.empty:
-        raise RuntimeError("jeu d'entraînement vide")
-
-    ds["label"] = label_pairs(ds, data.tables["imputation"])
-    ds[GROUP] = ds["payment_id"]
-    ds["period"] = assign_period(ds["day"], split).to_numpy()
-    ds["month"] = pd.to_datetime(ds["day"]).dt.strftime("%Y-%m")
     out_dir = interim_dir / "ml"
     out_dir.mkdir(parents=True, exist_ok=True)
-    ds.to_parquet(out_dir / "dataset", partition_cols=["month"], index=False)
+    key = dataset_key(meta["journal_sha256"], settings, rules)
+    ds = _saved_dataset(out_dir, key, log) if reuse_dataset else None
+    if ds is not None:
+        log(f"… jeu d'entraînement repris de {out_dir / 'dataset'} ({len(ds):,} paires)".replace(",", " "))
+        timings["jeu repris"] = True
+    else:
+        log(f"… rejeu {train_p.start} → {valid_p.end} pour construire le jeu d'entraînement")
+        run_replay(state, recorder, train_p.start, valid_p.end, settings.split.retention_days,
+                   label="jeu d'entraînement (rejeu train + validation)")
+        ds = recorder.dataset()
+        if ds.empty:
+            raise RuntimeError("jeu d'entraînement vide")
+        ds["label"] = label_pairs(ds, data.tables["imputation"])
+        ds[GROUP] = ds["payment_id"]
+        ds["period"] = assign_period(ds["day"], split).to_numpy()
+        ds["month"] = pd.to_datetime(ds["day"]).dt.strftime("%Y-%m")
+        # Réécriture complète : une écriture partitionnée ajoute des fichiers sans effacer les anciens.
+        shutil.rmtree(out_dir / "dataset", ignore_errors=True)
+        (out_dir / "dataset_meta.json").unlink(missing_ok=True)
+        ds.to_parquet(out_dir / "dataset", partition_cols=["month"], index=False)
+        (out_dir / "dataset_meta.json").write_text(json.dumps(key, indent=2), encoding="utf-8")
+    timings["construction du jeu"] = round(time.perf_counter() - t, 1)
     train, valid = ds[ds["period"] == "train"], ds[ds["period"] == "validation"]
     log(f"  jeu : {len(train):,} paires d'entraînement, {len(valid):,} de validation".replace(",", " "))
 

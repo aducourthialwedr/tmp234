@@ -268,10 +268,15 @@ class Project:
 
     # --- Étape 5 : apprentissage ----------------------------------------------------------------------------------
 
-    def train(self) -> dict:
-        """Rejoue entraînement + validation, entraîne le modèle, calibre les seuils, sauvegarde."""
+    def train(self, reuse_dataset: bool = False) -> dict:
+        """Rejoue entraînement + validation, entraîne le modèle, calibre les seuils, sauvegarde.
+
+        `reuse_dataset=True` : reprend le jeu d'entraînement déjà construit (apprentissage interrompu)
+        au lieu de rejouer train + validation ; refusé si les données ou les réglages ont changé.
+        """
         from src.reconcile_ml.pipeline import fit_ml
-        return fit_ml(self.interim_dir, self.model_dir, self.settings, self.rules, log=self.log)
+        return fit_ml(self.interim_dir, self.model_dir, self.settings, self.rules, log=self.log,
+                      reuse_dataset=reuse_dataset)
 
     def calibrate(self) -> dict:
         """Recalcule les seuils de décision du modèle existant sur la validation, sans réentraîner."""
