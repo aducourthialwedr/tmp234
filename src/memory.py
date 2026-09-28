@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import csv
 import gc
+import os
 import sys
 import threading
 import time
@@ -92,6 +93,32 @@ def pod_memory() -> dict[str, int | None]:
                 "anon": _stat(base + "memory.stat", "total_rss"),
                 "limit": limit if limit and limit < 2 ** 60 else None}      # « illimité » = très grand nombre
     return {"used": None, "anon": None, "limit": None}
+
+
+def available_cpus() -> int:
+    """CPU réellement utilisables : quota cgroup du pod et affinité, pas les cœurs du nœud.
+
+    Dans un conteneur, `os.cpu_count()` (et OpenMP) voient tous les cœurs de la machine hôte. Lancer
+    autant de threads que de cœurs du nœud sur un pod limité à quelques CPU fait brider les threads à
+    tour de rôle : le CPU affiché est plein, mais le calcul est 10 à 100 fois plus lent.
+    """
+    n = os.cpu_count() or 1
+    try:
+        n = min(n, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    quota = None
+    try:                                                                      # cgroup v2
+        q, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if q != "max":
+            quota = int(q) / int(period)
+    except (OSError, ValueError):
+        q, period = _read_int("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), _read_int("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        if q and q > 0 and period:                                            # cgroup v1
+            quota = q / period
+    if quota:
+        n = min(n, max(1, int(quota)))
+    return n
 
 
 def release_memory() -> None:
@@ -186,7 +213,8 @@ class MemoryMonitor:
         self._thread.start()
         limit = self.last.get("pod_limit_gb")
         self.echo(f"[mémoire] suivi → {self.path.resolve()} ; limite du pod : "
-                  f"{f'{limit:.1f} Go' if limit else 'non détectée (hors conteneur ?)'}")
+                  f"{f'{limit:.1f} Go' if limit else 'non détectée (hors conteneur ?)'} ; "
+                  f"CPU utilisables : {available_cpus()} (machine : {os.cpu_count()})")
         return self
 
     def stop(self) -> None:

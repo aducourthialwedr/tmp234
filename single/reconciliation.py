@@ -24,6 +24,7 @@ import json
 import lightgbm as lgb
 import math
 import numpy as np
+import os
 import pandas as pd
 import pickle
 import pyarrow as pa
@@ -314,6 +315,8 @@ class SetSettings(_Model):
 
 
 class TrainingSettings(_Model):
+    num_threads: int = Field(0, ge=0, description="Threads LightGBM (apprentissage et score). 0 = CPU "
+                             "utilisables du pod (quota cgroup), et non les cœurs de la machine hôte.")
     payment_sample: float = Field(0.5, gt=0, le=1, description="Part des paiements du résiduel conservés pour "
                                   "l'entraînement (tous leurs candidats sont gardés : pas d'échantillonnage des "
                                   "négatifs).")
@@ -644,6 +647,32 @@ def pod_memory() -> dict[str, int | None]:
     return {"used": None, "anon": None, "limit": None}
 
 
+def available_cpus() -> int:
+    """CPU réellement utilisables : quota cgroup du pod et affinité, pas les cœurs du nœud.
+
+    Dans un conteneur, `os.cpu_count()` (et OpenMP) voient tous les cœurs de la machine hôte. Lancer
+    autant de threads que de cœurs du nœud sur un pod limité à quelques CPU fait brider les threads à
+    tour de rôle : le CPU affiché est plein, mais le calcul est 10 à 100 fois plus lent.
+    """
+    n = os.cpu_count() or 1
+    try:
+        n = min(n, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    quota = None
+    try:                                                                      # cgroup v2
+        q, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if q != "max":
+            quota = int(q) / int(period)
+    except (OSError, ValueError):
+        q, period = _read_int("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), _read_int("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        if q and q > 0 and period:                                            # cgroup v1
+            quota = q / period
+    if quota:
+        n = min(n, max(1, int(quota)))
+    return n
+
+
 def release_memory() -> None:
     """Rend au système la mémoire libérée : ramasse-miettes, puis `malloc_trim` (glibc, Linux).
 
@@ -736,7 +765,8 @@ class MemoryMonitor:
         self._thread.start()
         limit = self.last.get("pod_limit_gb")
         self.echo(f"[mémoire] suivi → {self.path.resolve()} ; limite du pod : "
-                  f"{f'{limit:.1f} Go' if limit else 'non détectée (hors conteneur ?)'}")
+                  f"{f'{limit:.1f} Go' if limit else 'non détectée (hors conteneur ?)'} ; "
+                  f"CPU utilisables : {available_cpus()} (machine : {os.cpu_count()})")
         return self
 
     def stop(self) -> None:
@@ -868,7 +898,7 @@ def chart(path: str | Path = "reports/memory.csv", session: int = -1):
 # Espace de noms « memory » (src/memory.py dans le dépôt).
 memory = SimpleNamespace(**{n: globals()[n] for n in (
     'MemoryMonitor', 'by_phase', 'chart', 'end_day', 'mark', 'mark_day', 'mark_step',
-    'pod_memory', 'process_rss', 'read_history', 'release_memory')})
+    'pod_memory', 'process_rss', 'read_history', 'release_memory', 'available_cpus')})
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -5757,7 +5787,13 @@ def competition_features(scores: np.ndarray, group: np.ndarray) -> pd.DataFrame:
 def _params(cfg: TrainingSettings) -> dict:
     return {"objective": "binary", "learning_rate": cfg.learning_rate, "num_leaves": cfg.num_leaves,
             "min_data_in_leaf": cfg.min_data_in_leaf, "feature_fraction": 0.9, "seed": cfg.seed,
-            "deterministic": True, "force_row_wise": True, "verbosity": -1, "num_threads": 0}
+            "deterministic": True, "force_row_wise": True, "verbosity": -1, "num_threads": threads(cfg.num_threads)}
+
+
+def threads(requested: int = 0) -> int:
+    """Threads LightGBM : `requested` s'il est fixé, sinon les CPU utilisables du pod (jamais les cœurs
+    du nœud, que LightGBM prendrait avec num_threads=0 : threads bridés, calcul très ralenti)."""
+    return requested if requested > 0 else available_cpus()
 
 
 def _train(X: pd.DataFrame, y: np.ndarray, Xv: pd.DataFrame | None, yv: np.ndarray | None,
@@ -5780,16 +5816,17 @@ class PairModel:
     pass2: lgb.Booster | None
     calibrator: IsotonicRegression | None
     meta: dict = field(default_factory=dict)
+    threads: int = field(default_factory=threads)
 
     # --- Scoring -------------------------------------------------------------------------------------
 
     def raw(self, X: pd.DataFrame, group: np.ndarray) -> np.ndarray:
-        s1 = self.pass1.predict(X[self.features], num_threads=0)
+        s1 = self.pass1.predict(X[self.features], num_threads=self.threads)
         if self.pass2 is None:
             return s1
         comp = competition_features(s1, group)
         X2 = pd.concat([X[self.features].reset_index(drop=True), comp], axis=1)
-        return self.pass2.predict(X2, num_threads=0)
+        return self.pass2.predict(X2, num_threads=self.threads)
 
     def calibrate(self, raw: np.ndarray) -> np.ndarray:
         return self.calibrator.predict(raw) if self.calibrator is not None else raw
@@ -5815,9 +5852,9 @@ class PairModel:
             for k in range(folds):
                 m = _train(X[fold != k], y[fold != k], None, None, fixed,
                            f"LightGBM passe 1, pli {k + 1}/{folds} (scores hors échantillon)")
-                oof[fold == k] = m.predict(X[fold == k], num_threads=0)
+                oof[fold == k] = m.predict(X[fold == k], num_threads=threads(cfg.num_threads))
             X2 = pd.concat([X.reset_index(drop=True), competition_features(oof, train[GROUP].to_numpy())], axis=1)
-            s1v = pass1.predict(Xv, num_threads=0)
+            s1v = pass1.predict(Xv, num_threads=threads(cfg.num_threads))
             Xv2 = pd.concat([Xv.reset_index(drop=True), competition_features(s1v, valid[GROUP].to_numpy())], axis=1)
             pass2 = _train(X2, y, Xv2, yv, cfg, "LightGBM passe 2")
         model = cls(features, pass1, pass2, None)
@@ -6184,6 +6221,7 @@ class PipelineMatcher(_ResidualMixin):
         super().__init__(state, settings, rules)
         self._setup_ml(settings, model.meta.get("categories"))
         self.model = model
+        model.threads = threads(settings.reconcile_ml.training.num_threads)
         self.record_proposals = record_proposals
         self.thresholds = model.meta.get("thresholds") if not record_proposals else             {"tau_high": 2.0, "tau_low": 0.0, "min_margin": 0.0, "kinds": {}, "segments": {}}
         self._daily: list[pd.DataFrame] = []
@@ -6977,6 +7015,9 @@ reconcile_ml:
     min_data_in_leaf: 50
     # Graine (reproductibilité).
     seed: 42
+    # Threads LightGBM (apprentissage et score). 0 = CPU utilisables du pod (quota cgroup), et non
+    # les cœurs de la machine hôte.
+    num_threads: 0
   # Résolution des ensembles.
   sets:
     # Reconstitution des ensembles (1↔n, n↔n) par DFS borné.

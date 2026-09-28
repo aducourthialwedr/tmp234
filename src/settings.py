@@ -173,6 +173,8 @@ class SetSettings(_Model):
 
 
 class TrainingSettings(_Model):
+    num_threads: int = Field(0, ge=0, description="Threads LightGBM (apprentissage et score). 0 = CPU "
+                             "utilisables du pod (quota cgroup), et non les cœurs de la machine hôte.")
     payment_sample: float = Field(0.5, gt=0, le=1, description="Part des paiements du résiduel conservés pour "
                                   "l'entraînement (tous leurs candidats sont gardés : pas d'échantillonnage des "
                                   "négatifs).")

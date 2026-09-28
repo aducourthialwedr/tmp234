@@ -43,3 +43,8 @@ def test_marks_without_monitor_are_noops():
     memory.mark("x")
     memory.mark_day("2024-01-01", 1)
     memory.end_day()
+
+
+def test_available_cpus_is_bounded_by_machine():
+    import os
+    assert 1 <= memory.available_cpus() <= (os.cpu_count() or 1)

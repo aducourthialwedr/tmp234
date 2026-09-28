@@ -162,6 +162,9 @@ reconcile_ml:
     min_data_in_leaf: 50
     # Graine (reproductibilité).
     seed: 42
+    # Threads LightGBM (apprentissage et score). 0 = CPU utilisables du pod (quota cgroup), et non
+    # les cœurs de la machine hôte.
+    num_threads: 0
   # Résolution des ensembles.
   sets:
     # Reconstitution des ensembles (1↔n, n↔n) par DFS borné.

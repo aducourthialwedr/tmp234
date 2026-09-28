@@ -27,6 +27,7 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 
 from src import progress
+from src.memory import available_cpus
 from src.reconcile_ml.features import CATEGORICAL, COMPETITION
 from src.settings import TrainingSettings
 
@@ -56,7 +57,13 @@ def competition_features(scores: np.ndarray, group: np.ndarray) -> pd.DataFrame:
 def _params(cfg: TrainingSettings) -> dict:
     return {"objective": "binary", "learning_rate": cfg.learning_rate, "num_leaves": cfg.num_leaves,
             "min_data_in_leaf": cfg.min_data_in_leaf, "feature_fraction": 0.9, "seed": cfg.seed,
-            "deterministic": True, "force_row_wise": True, "verbosity": -1, "num_threads": 0}
+            "deterministic": True, "force_row_wise": True, "verbosity": -1, "num_threads": threads(cfg.num_threads)}
+
+
+def threads(requested: int = 0) -> int:
+    """Threads LightGBM : `requested` s'il est fixé, sinon les CPU utilisables du pod (jamais les cœurs
+    du nœud, que LightGBM prendrait avec num_threads=0 : threads bridés, calcul très ralenti)."""
+    return requested if requested > 0 else available_cpus()
 
 
 def _train(X: pd.DataFrame, y: np.ndarray, Xv: pd.DataFrame | None, yv: np.ndarray | None,
@@ -79,16 +86,17 @@ class PairModel:
     pass2: lgb.Booster | None
     calibrator: IsotonicRegression | None
     meta: dict = field(default_factory=dict)
+    threads: int = field(default_factory=threads)
 
     # --- Scoring -------------------------------------------------------------------------------------
 
     def raw(self, X: pd.DataFrame, group: np.ndarray) -> np.ndarray:
-        s1 = self.pass1.predict(X[self.features], num_threads=0)
+        s1 = self.pass1.predict(X[self.features], num_threads=self.threads)
         if self.pass2 is None:
             return s1
         comp = competition_features(s1, group)
         X2 = pd.concat([X[self.features].reset_index(drop=True), comp], axis=1)
-        return self.pass2.predict(X2, num_threads=0)
+        return self.pass2.predict(X2, num_threads=self.threads)
 
     def calibrate(self, raw: np.ndarray) -> np.ndarray:
         return self.calibrator.predict(raw) if self.calibrator is not None else raw
@@ -114,9 +122,9 @@ class PairModel:
             for k in range(folds):
                 m = _train(X[fold != k], y[fold != k], None, None, fixed,
                            f"LightGBM passe 1, pli {k + 1}/{folds} (scores hors échantillon)")
-                oof[fold == k] = m.predict(X[fold == k], num_threads=0)
+                oof[fold == k] = m.predict(X[fold == k], num_threads=threads(cfg.num_threads))
             X2 = pd.concat([X.reset_index(drop=True), competition_features(oof, train[GROUP].to_numpy())], axis=1)
-            s1v = pass1.predict(Xv, num_threads=0)
+            s1v = pass1.predict(Xv, num_threads=threads(cfg.num_threads))
             Xv2 = pd.concat([Xv.reset_index(drop=True), competition_features(s1v, valid[GROUP].to_numpy())], axis=1)
             pass2 = _train(X2, y, Xv2, yv, cfg, "LightGBM passe 2")
         model = cls(features, pass1, pass2, None)

@@ -24,7 +24,7 @@ from src.evaluation.metrics import ground_truth
 from src.load.interim import load_interim
 from src.reconcile_ml.decision import calibrate_online, calibrate_thresholds, decide, propose
 from src.reconcile_ml.features import FEATURIZATION_VERSION, Featurizer, active_features
-from src.reconcile_ml.model import GROUP, PairModel, calibration_table, fingerprint, pair_metrics
+from src.reconcile_ml.model import GROUP, PairModel, threads, calibration_table, fingerprint, pair_metrics
 from src.reconcile_rules.matcher import RulesMatcher
 from src.reconcile_rules.subset import near_subsets
 from src.settings import RulesConfig, Settings
@@ -132,6 +132,7 @@ class PipelineMatcher(_ResidualMixin):
         super().__init__(state, settings, rules)
         self._setup_ml(settings, model.meta.get("categories"))
         self.model = model
+        model.threads = threads(settings.reconcile_ml.training.num_threads)
         self.record_proposals = record_proposals
         self.thresholds = model.meta.get("thresholds") if not record_proposals else             {"tau_high": 2.0, "tau_low": 0.0, "min_margin": 0.0, "kinds": {}, "segments": {}}
         self._daily: list[pd.DataFrame] = []
