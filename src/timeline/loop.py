@@ -30,7 +30,7 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
-from src import memory
+from src import memory, progress
 from src.timeline.state import DAY_US, LedgerState, _to_us
 
 AUTO, REVIEW, REJECT = "auto", "review", "reject"
@@ -167,8 +167,17 @@ def _validate(decisions: pd.DataFrame, ctx: DayContext) -> pd.DataFrame:
 
 
 def run_replay(state: LedgerState, matcher: Matcher, start: date, end: date, retention_days: int = 60,
-               on_day: Callable[[DayContext, dict], None] | None = None) -> ReplayResult:
-    """Rejoue les jours [start, end] avec `matcher` ; décisions contrôlées et journalisées."""
+               on_day: Callable[[DayContext, dict], None] | None = None, label: str | None = None) -> ReplayResult:
+    """Rejoue les jours [start, end] avec `matcher` ; décisions contrôlées et journalisées.
+
+    `label` : nom de la tâche dans le suivi de progression (`src/progress.py`).
+    """
+    with progress.task(label or f"rejeu {getattr(matcher, 'name', 'rapprocheur')}",
+                       (pd.Timestamp(end) - pd.Timestamp(start)).days + 1, "jours") as task:
+        return _run_replay(state, matcher, start, end, retention_days, on_day, task)
+
+
+def _run_replay(state, matcher, start, end, retention_days, on_day, task) -> ReplayResult:
     t0 = time.perf_counter()
     it = DailyIterator(state, start, end, retention_days)
     frames, daily = [], []
@@ -185,6 +194,7 @@ def run_replay(state: LedgerState, matcher: Matcher, start: date, end: date, ret
                "seconds": round(time.perf_counter() - t, 4)}
         daily.append(row)
         memory.end_day()
+        task.advance(1, f"{ctx.day.date()} · lot {row['batch']} · auto {row['auto']}")
         if on_day is not None:
             on_day(ctx, row)
     decisions = pd.concat(frames, ignore_index=True) if frames else empty_decisions().assign(

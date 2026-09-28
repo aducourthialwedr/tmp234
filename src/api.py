@@ -31,7 +31,7 @@ from typing import Any
 
 import pandas as pd
 
-from src import memory
+from src import memory, progress
 from src.config import DEFAULT_SCHEMA_PATH, DEFAULT_SETTINGS_PATH, REPO_ROOT, read_yaml, resolve_path
 from src.settings import DEFAULT_RULES_PATH, RulesConfig, Settings, load_rules, load_settings
 
@@ -66,6 +66,8 @@ class Project:
             raise ValueError(f"dataset : {SYNTHETIC!r} ou {REAL!r}")
         self.settings_path, self.schema_path, self.rules_path = (
             Path(self.settings_path), Path(self.schema_path), Path(self.rules_path))
+        if not progress.active():                  # progression dans le journal, sauf afficheur choisi
+            progress.use_log(self.log)
 
     # --- Configuration et chemins -------------------------------------------------------------------------
 
@@ -209,12 +211,8 @@ class Project:
             m = self._matcher(matcher, state, settings)
         start, end = self._period(state, period)
         self.log(f"… rejeu {period} du {start.date()} au {end.date()} ({matcher})")
-
-        def progress(ctx, row):
-            if ctx.day.day == 1 or ctx.day == end:
-                self.log(f"  {ctx.day.date()} : lot {row['batch']:,} (nouveaux {row['new']:,})".replace(",", " "))
-
-        result = run_replay(state, m, start.date(), end.date(), settings.split.retention_days, on_day=progress)
+        result = run_replay(state, m, start.date(), end.date(), settings.split.retention_days,
+                            label=f"rejeu {period} ({matcher})")
         timings["rejeu"] = result.seconds
         tag = f"replay_{matcher}_{period}"
         out, rep = self.interim_dir / "replay", self.reports_dir
@@ -251,7 +249,7 @@ class Project:
         start, end = self._period(state, period)
         self.log(f"… allocation {period} du {start.date()} au {end.date()}")
         result = run_replay(state, probe, start.date(), end.date(), settings.split.retention_days,
-                            on_day=lambda ctx, row: self.log(f"  {ctx.day.date()}") if ctx.day.day == 1 else None)
+                            label=f"allocation {period}")
         timings["rejeu"] = result.seconds
         truth = truth_debtors(data.tables["imputation"], data.tables["invoice"])
         metrics = allocation_metrics(probe.first_pass(), probe.last_pass(), truth, settings.allocation.target_recall,

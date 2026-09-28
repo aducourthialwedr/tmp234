@@ -26,6 +26,7 @@ import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 
+from src import progress
 from src.reconcile_ml.features import CATEGORICAL, COMPETITION
 from src.settings import TrainingSettings
 
@@ -59,12 +60,16 @@ def _params(cfg: TrainingSettings) -> dict:
 
 
 def _train(X: pd.DataFrame, y: np.ndarray, Xv: pd.DataFrame | None, yv: np.ndarray | None,
-           cfg: TrainingSettings) -> lgb.Booster:
+           cfg: TrainingSettings, label: str = "LightGBM") -> lgb.Booster:
     cats = [c for c in CATEGORICAL if c in X.columns]
     train = lgb.Dataset(X, label=y, categorical_feature=cats, free_raw_data=True)
     valid = [lgb.Dataset(Xv, label=yv, categorical_feature=cats, reference=train)] if Xv is not None else []
-    callbacks = [lgb.early_stopping(30, verbose=False)] if valid else []
-    return lgb.train(_params(cfg), train, num_boost_round=cfg.num_boost_round, valid_sets=valid, callbacks=callbacks)
+    with progress.task(f"{label} ({len(X)} paires)", cfg.num_boost_round, "itérations") as task:
+        callbacks = [progress.lightgbm_callback(task)]
+        if valid:
+            callbacks.append(lgb.early_stopping(30, verbose=False))
+        return lgb.train(_params(cfg), train, num_boost_round=cfg.num_boost_round, valid_sets=valid,
+                         callbacks=callbacks)
 
 
 @dataclass
@@ -99,7 +104,7 @@ class PairModel:
             second_pass: bool = True, calibration: bool = True, folds: int = 3) -> PairModel:
         y, yv = train["label"].to_numpy(), valid["label"].to_numpy()
         X, Xv = train[features], valid[features]
-        pass1 = _train(X, y, Xv, yv, cfg)
+        pass1 = _train(X, y, Xv, yv, cfg, "LightGBM passe 1")
         pass2 = None
         if second_pass:
             # Scores de passe 1 hors échantillon sur l'entraînement (plis par paiement).
@@ -107,12 +112,13 @@ class PairModel:
             oof = np.zeros(len(train))
             fixed = cfg.model_copy(update={"num_boost_round": max(pass1.best_iteration, 10)})
             for k in range(folds):
-                m = _train(X[fold != k], y[fold != k], None, None, fixed)
+                m = _train(X[fold != k], y[fold != k], None, None, fixed,
+                           f"LightGBM passe 1, pli {k + 1}/{folds} (scores hors échantillon)")
                 oof[fold == k] = m.predict(X[fold == k], num_threads=0)
             X2 = pd.concat([X.reset_index(drop=True), competition_features(oof, train[GROUP].to_numpy())], axis=1)
             s1v = pass1.predict(Xv, num_threads=0)
             Xv2 = pd.concat([Xv.reset_index(drop=True), competition_features(s1v, valid[GROUP].to_numpy())], axis=1)
-            pass2 = _train(X2, y, Xv2, yv, cfg)
+            pass2 = _train(X2, y, Xv2, yv, cfg, "LightGBM passe 2")
         model = cls(features, pass1, pass2, None)
         if calibration:
             raw_v = model.raw(valid, valid[GROUP].to_numpy())

@@ -333,7 +333,7 @@ def fit_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules: RulesC
     recorder = DatasetRecorder(state, settings, rules)
     log(f"… rejeu {train_p.start} → {valid_p.end} pour construire le jeu d'entraînement")
     run_replay(state, recorder, train_p.start, valid_p.end, settings.split.retention_days,
-               on_day=lambda ctx, row: log(f"  {ctx.day.date()}") if ctx.day.day == 1 else None)
+               label="jeu d'entraînement (rejeu train + validation)")
     ds = recorder.dataset()
     timings["construction du jeu"] = round(time.perf_counter() - t, 1)
     if ds.empty:
@@ -402,7 +402,8 @@ def online_thresholds(data, journal, model: PairModel, settings: Settings, rules
     log(f"… rejeu de la validation pour calibrer les seuils ({valid_p.start} → {valid_p.end})")
     state = LedgerState(data, journal, settings.reconcile_ml.features.behavioral_window_days)
     probe = PipelineMatcher(state, settings, rules, model, record_proposals=True)
-    run_replay(state, probe, valid_p.start, valid_p.end, settings.split.retention_days)
+    run_replay(state, probe, valid_p.start, valid_p.end, settings.split.retention_days,
+               label="calibration des seuils (rejeu validation)")
     daily = probe.daily_proposals()
     if daily.empty:
         return dict(model.meta.get("thresholds") or {})

@@ -26,13 +26,18 @@ import altair as alt
 import pandas as pd
 from IPython.display import Markdown, display
 
-from src import memory
+from src import memory, progress
 from src.api import Project
 
 pd.set_option("display.max_columns", 50)
 MEMORY_LOG = ROOT / "reports" / "memory.csv"
 N_PAYMENTS = 50_000          # 2_000_000 pour le volume réel (≈ 1 h de bout en bout)"""),
-    ("md", """## Suivi de la mémoire
+    ("md", """## Suivi de la mémoire et de la progression
+
+Les tâches longues affichent une **barre de progression** dans la sortie de leur cellule : jours rejoués
+(allocation, règles, backtest, jeu d'entraînement, calibration des seuils) et itérations LightGBM (passe 1,
+plis hors échantillon, passe 2). Chaque barre donne le temps écoulé, le temps restant estimé et un détail
+(jour et taille du lot, perte de validation).
 
 La cellule suivante lance un relevé chaque seconde :
 - **RSS** : mémoire du processus ;
@@ -53,6 +58,7 @@ concerné. Pour suivre en direct hors du notebook, ouvrir un terminal JupyterLab
 avec `MALLOC_ARENA_MAX=2` dans l'environnement, qui limite la fragmentation de glibc."""),
     ("code", """monitor = memory.MemoryMonitor(MEMORY_LOG, interval=1.0, trim_daily=True).start()
 monitor.live()                                     # pastille mise à jour chaque seconde
+progress.use_notebook()                            # barres de progression (rejeux, apprentissage)
 project = Project(dataset="synthetic", log=monitor.log)"""),
     ("md", """### Réglages mémoire
 

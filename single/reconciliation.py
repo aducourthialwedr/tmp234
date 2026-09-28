@@ -19,6 +19,7 @@ import copy
 import csv
 import gc
 import hashlib
+import html
 import json
 import lightgbm as lgb
 import math
@@ -868,6 +869,193 @@ def chart(path: str | Path = "reports/memory.csv", session: int = -1):
 memory = SimpleNamespace(**{n: globals()[n] for n in (
     'MemoryMonitor', 'by_phase', 'chart', 'end_day', 'mark', 'mark_day', 'mark_step',
     'pod_memory', 'process_rss', 'read_history', 'release_memory')})
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# src/progress.py
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+"""Suivi de progression des tâches longues : rejeux jour par jour, apprentissage LightGBM.
+
+    from src import progress
+    progress.use_notebook()        # barres mises à jour en place dans le notebook
+    progress.use_log(print)        # ou : une ligne de journal toutes les 30 s (console, interface)
+
+Chaque tâche affiche : avancement (jours, itérations), temps écoulé, temps restant estimé et un détail
+(jour et taille du lot, perte de validation LightGBM...). Sans afficheur choisi, `Project` journalise
+la progression par son `log`. Les tâches s'annoncent avec `progress.task(...)` ; sans afficheur actif,
+elles ne coûtent rien.
+"""
+
+
+
+_REPORTER: Reporter | None = None
+
+
+def _duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {seconds:02d} s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} min"
+
+
+class Task:
+    """Une tâche mesurable : `total` unités (jours, itérations) ; `advance` à chaque unité faite."""
+
+    def __init__(self, label: str, total: int, unit: str):
+        self.label, self.total, self.unit = label, max(int(total), 0), unit
+        self.done = 0
+        self.detail = ""
+        self.started = time.time()
+        self.finished = False
+
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self.started
+
+    @property
+    def remaining(self) -> float | None:
+        if self.done == 0 or self.total == 0 or self.finished:
+            return None
+        return self.elapsed / self.done * max(self.total - self.done, 0)
+
+    @property
+    def fraction(self) -> float:
+        return 1.0 if self.finished else (min(self.done / self.total, 1.0) if self.total else 0.0)
+
+    def advance(self, n: int = 1, detail: str | None = None) -> None:
+        self.done += n
+        if detail is not None:
+            self.detail = detail
+        if _REPORTER is not None:
+            _REPORTER.update(self)
+
+    def text(self) -> str:
+        head = f"{self.label} : {self.done}/{self.total} {self.unit} ({self.fraction * 100:.0f} %)"
+        timing = f"{_duration(self.elapsed)} écoulées"
+        if self.finished:
+            timing = f"terminé en {_duration(self.elapsed)}"
+        elif self.remaining is not None:
+            timing += f", reste ~{_duration(self.remaining)}"
+        return " · ".join(p for p in (head, timing, self.detail) if p)
+
+
+@contextmanager
+def task(label: str, total: int, unit: str = "") -> Iterator[Task]:
+    t = Task(label, total, unit)
+    if _REPORTER is not None:
+        _REPORTER.start(t)
+    try:
+        yield t
+    finally:
+        t.finished = True
+        if _REPORTER is not None:
+            _REPORTER.finish(t)
+
+
+# --- Afficheurs -----------------------------------------------------------------------------------------
+
+class Reporter:
+    def start(self, t: Task) -> None: ...
+    def update(self, t: Task) -> None: ...
+    def finish(self, t: Task) -> None: ...
+
+
+class LogReporter(Reporter):
+    """Une ligne au début, puis toutes les `every` secondes, puis à la fin."""
+
+    def __init__(self, log: Callable[[str], None], every: float = 30.0):
+        self.log, self.every = log, every
+        self._last: dict[int, float] = {}
+
+    def start(self, t: Task) -> None:
+        self._last[id(t)] = time.time()
+        self.log(f"▶ {t.label} ({t.total} {t.unit})")
+
+    def update(self, t: Task) -> None:
+        now = time.time()
+        if now - self._last.get(id(t), 0) >= self.every:
+            self._last[id(t)] = now
+            self.log(f"  {t.text()}")
+
+    def finish(self, t: Task) -> None:
+        self._last.pop(id(t), None)
+        self.log(f"✓ {t.text()}")
+
+
+class NotebookReporter(Reporter):
+    """Une barre par tâche, mise à jour en place dans la sortie de la cellule (au plus 2 fois par seconde)."""
+
+    def __init__(self, every: float = 0.5):
+        self.every = every
+        self._handles: dict[int, tuple[object, float]] = {}
+
+    @staticmethod
+    def _html(t: Task):
+        from IPython.display import HTML
+        color = "#2e7d32" if t.finished else "#1565c0"
+        return HTML(
+            f'<div style="font-family:monospace;font-size:12px;margin:2px 0">'
+            f'<div style="width:360px;height:8px;background:#e0e0e0;border-radius:4px;display:inline-block;'
+            f'vertical-align:middle;margin-right:8px"><div style="width:{t.fraction * 100:.1f}%;height:8px;'
+            f'background:{color};border-radius:4px"></div></div>{html.escape(t.text())}</div>')
+
+    def start(self, t: Task) -> None:
+        from IPython.display import display
+        self._handles[id(t)] = (display(self._html(t), display_id=True), time.time())
+
+    def update(self, t: Task) -> None:
+        handle, last = self._handles.get(id(t), (None, 0.0))
+        if handle is not None and time.time() - last >= self.every:
+            handle.update(self._html(t))
+            self._handles[id(t)] = (handle, time.time())
+
+    def finish(self, t: Task) -> None:
+        handle, _ = self._handles.pop(id(t), (None, 0.0))
+        if handle is not None:
+            handle.update(self._html(t))
+
+
+def use_notebook() -> None:
+    """Barres de progression dans le notebook (Jupyter)."""
+    global _REPORTER
+    _REPORTER = NotebookReporter()
+
+
+def use_log(log: Callable[[str], None] = print, every: float = 30.0) -> None:
+    """Progression écrite dans un journal (console, interface), une ligne toutes les `every` secondes."""
+    global _REPORTER
+    _REPORTER = LogReporter(log, every)
+
+
+def disable() -> None:
+    global _REPORTER
+    _REPORTER = None
+
+
+def active() -> bool:
+    return _REPORTER is not None
+
+
+# --- LightGBM -------------------------------------------------------------------------------------------
+
+def lightgbm_callback(t: Task):
+    """Callback LightGBM : une unité par itération, perte de validation en détail."""
+    def callback(env) -> None:
+        results = env.evaluation_result_list or []
+        detail = " · ".join(f"{name} {value:.5f}" for _, name, value, *_ in results)
+        t.advance(1, f"itération {env.iteration + 1}" + (f" · {detail}" if detail else ""))
+    callback.order = 5
+    return callback
+
+
+# Espace de noms « progress » (src/progress.py dans le dépôt).
+progress = SimpleNamespace(**{n: globals()[n] for n in (
+    'Task', 'task', 'use_notebook', 'use_log', 'disable', 'active', 'lightgbm_callback')})
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -3387,8 +3575,17 @@ def _validate(decisions: pd.DataFrame, ctx: DayContext) -> pd.DataFrame:
 
 
 def run_replay(state: LedgerState, matcher: Matcher, start: date, end: date, retention_days: int = 60,
-               on_day: Callable[[DayContext, dict], None] | None = None) -> ReplayResult:
-    """Rejoue les jours [start, end] avec `matcher` ; décisions contrôlées et journalisées."""
+               on_day: Callable[[DayContext, dict], None] | None = None, label: str | None = None) -> ReplayResult:
+    """Rejoue les jours [start, end] avec `matcher` ; décisions contrôlées et journalisées.
+
+    `label` : nom de la tâche dans le suivi de progression (`src/progress.py`).
+    """
+    with progress.task(label or f"rejeu {getattr(matcher, 'name', 'rapprocheur')}",
+                       (pd.Timestamp(end) - pd.Timestamp(start)).days + 1, "jours") as task:
+        return _run_replay(state, matcher, start, end, retention_days, on_day, task)
+
+
+def _run_replay(state, matcher, start, end, retention_days, on_day, task) -> ReplayResult:
     t0 = time.perf_counter()
     it = DailyIterator(state, start, end, retention_days)
     frames, daily = [], []
@@ -3405,6 +3602,7 @@ def run_replay(state: LedgerState, matcher: Matcher, start: date, end: date, ret
                "seconds": round(time.perf_counter() - t, 4)}
         daily.append(row)
         memory.end_day()
+        task.advance(1, f"{ctx.day.date()} · lot {row['batch']} · auto {row['auto']}")
         if on_day is not None:
             on_day(ctx, row)
     decisions = pd.concat(frames, ignore_index=True) if frames else empty_decisions().assign(
@@ -5563,12 +5761,16 @@ def _params(cfg: TrainingSettings) -> dict:
 
 
 def _train(X: pd.DataFrame, y: np.ndarray, Xv: pd.DataFrame | None, yv: np.ndarray | None,
-           cfg: TrainingSettings) -> lgb.Booster:
+           cfg: TrainingSettings, label: str = "LightGBM") -> lgb.Booster:
     cats = [c for c in CATEGORICAL if c in X.columns]
     train = lgb.Dataset(X, label=y, categorical_feature=cats, free_raw_data=True)
     valid = [lgb.Dataset(Xv, label=yv, categorical_feature=cats, reference=train)] if Xv is not None else []
-    callbacks = [lgb.early_stopping(30, verbose=False)] if valid else []
-    return lgb.train(_params(cfg), train, num_boost_round=cfg.num_boost_round, valid_sets=valid, callbacks=callbacks)
+    with progress.task(f"{label} ({len(X)} paires)", cfg.num_boost_round, "itérations") as task:
+        callbacks = [progress.lightgbm_callback(task)]
+        if valid:
+            callbacks.append(lgb.early_stopping(30, verbose=False))
+        return lgb.train(_params(cfg), train, num_boost_round=cfg.num_boost_round, valid_sets=valid,
+                         callbacks=callbacks)
 
 
 @dataclass
@@ -5603,7 +5805,7 @@ class PairModel:
             second_pass: bool = True, calibration: bool = True, folds: int = 3) -> PairModel:
         y, yv = train["label"].to_numpy(), valid["label"].to_numpy()
         X, Xv = train[features], valid[features]
-        pass1 = _train(X, y, Xv, yv, cfg)
+        pass1 = _train(X, y, Xv, yv, cfg, "LightGBM passe 1")
         pass2 = None
         if second_pass:
             # Scores de passe 1 hors échantillon sur l'entraînement (plis par paiement).
@@ -5611,12 +5813,13 @@ class PairModel:
             oof = np.zeros(len(train))
             fixed = cfg.model_copy(update={"num_boost_round": max(pass1.best_iteration, 10)})
             for k in range(folds):
-                m = _train(X[fold != k], y[fold != k], None, None, fixed)
+                m = _train(X[fold != k], y[fold != k], None, None, fixed,
+                           f"LightGBM passe 1, pli {k + 1}/{folds} (scores hors échantillon)")
                 oof[fold == k] = m.predict(X[fold == k], num_threads=0)
             X2 = pd.concat([X.reset_index(drop=True), competition_features(oof, train[GROUP].to_numpy())], axis=1)
             s1v = pass1.predict(Xv, num_threads=0)
             Xv2 = pd.concat([Xv.reset_index(drop=True), competition_features(s1v, valid[GROUP].to_numpy())], axis=1)
-            pass2 = _train(X2, y, Xv2, yv, cfg)
+            pass2 = _train(X2, y, Xv2, yv, cfg, "LightGBM passe 2")
         model = cls(features, pass1, pass2, None)
         if calibration:
             raw_v = model.raw(valid, valid[GROUP].to_numpy())
@@ -6182,7 +6385,7 @@ def fit_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules: RulesC
     recorder = DatasetRecorder(state, settings, rules)
     log(f"… rejeu {train_p.start} → {valid_p.end} pour construire le jeu d'entraînement")
     run_replay(state, recorder, train_p.start, valid_p.end, settings.split.retention_days,
-               on_day=lambda ctx, row: log(f"  {ctx.day.date()}") if ctx.day.day == 1 else None)
+               label="jeu d'entraînement (rejeu train + validation)")
     ds = recorder.dataset()
     timings["construction du jeu"] = round(time.perf_counter() - t, 1)
     if ds.empty:
@@ -6251,7 +6454,8 @@ def online_thresholds(data, journal, model: PairModel, settings: Settings, rules
     log(f"… rejeu de la validation pour calibrer les seuils ({valid_p.start} → {valid_p.end})")
     state = LedgerState(data, journal, settings.reconcile_ml.features.behavioral_window_days)
     probe = PipelineMatcher(state, settings, rules, model, record_proposals=True)
-    run_replay(state, probe, valid_p.start, valid_p.end, settings.split.retention_days)
+    run_replay(state, probe, valid_p.start, valid_p.end, settings.split.retention_days,
+               label="calibration des seuils (rejeu validation)")
     daily = probe.daily_proposals()
     if daily.empty:
         return dict(model.meta.get("thresholds") or {})
@@ -6341,6 +6545,8 @@ class Project:
             raise ValueError(f"dataset : {SYNTHETIC!r} ou {REAL!r}")
         self.settings_path, self.schema_path, self.rules_path = (
             Path(self.settings_path), Path(self.schema_path), Path(self.rules_path))
+        if not progress.active():                  # progression dans le journal, sauf afficheur choisi
+            progress.use_log(self.log)
 
     # --- Configuration et chemins -------------------------------------------------------------------------
 
@@ -6468,12 +6674,8 @@ class Project:
             m = self._matcher(matcher, state, settings)
         start, end = self._period(state, period)
         self.log(f"… rejeu {period} du {start.date()} au {end.date()} ({matcher})")
-
-        def progress(ctx, row):
-            if ctx.day.day == 1 or ctx.day == end:
-                self.log(f"  {ctx.day.date()} : lot {row['batch']:,} (nouveaux {row['new']:,})".replace(",", " "))
-
-        result = run_replay(state, m, start.date(), end.date(), settings.split.retention_days, on_day=progress)
+        result = run_replay(state, m, start.date(), end.date(), settings.split.retention_days,
+                            label=f"rejeu {period} ({matcher})")
         timings["rejeu"] = result.seconds
         tag = f"replay_{matcher}_{period}"
         out, rep = self.interim_dir / "replay", self.reports_dir
@@ -6507,7 +6709,7 @@ class Project:
         start, end = self._period(state, period)
         self.log(f"… allocation {period} du {start.date()} au {end.date()}")
         result = run_replay(state, probe, start.date(), end.date(), settings.split.retention_days,
-                            on_day=lambda ctx, row: self.log(f"  {ctx.day.date()}") if ctx.day.day == 1 else None)
+                            label=f"allocation {period}")
         timings["rejeu"] = result.seconds
         truth = truth_debtors(data.tables["imputation"], data.tables["invoice"])
         metrics = allocation_metrics(probe.first_pass(), probe.last_pass(), truth, settings.allocation.target_recall,

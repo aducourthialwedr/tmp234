@@ -419,6 +419,12 @@ tenues dans le code :
 Toutes ces optimisations donnent des résultats identiques, ce que vérifient des tests (passage en
 blocs = passage unique).
 
+**Suivi de progression** (`src/progress.py`). Chaque rejeu (`run_replay(..., label=...)`) et chaque
+entraînement LightGBM (passe 1, plis hors échantillon, passe 2) est une tâche. L'avancement, le temps
+écoulé, le temps restant estimé et un détail (jour et lot, perte de validation) s'affichent :
+- en barres dans le notebook, avec `progress.use_notebook()` ;
+- sinon dans le journal de `Project`, une ligne toutes les 30 s (interface, console).
+
 **Suivi mémoire** (`src/memory.py`, section « Suivi de la mémoire » du notebook). `MemoryMonitor` relève
 chaque seconde :
 - la RSS du processus ;
