@@ -4,7 +4,7 @@ import streamlit as st
 
 from src.config import resolve_path
 from src.load.normalize import label_numbers, normalize_text, reference_keys
-from src.synthetic.generate import SyntheticConfig
+from src.synthetic.generate import SyntheticConfig  # synthétique seulement
 from src.ui.common import (
     SYNTHETIC, current_settings, dataset, interim_dir, load_meta, read_report, run_task, schema_path,
     settings_path, step_header,
@@ -17,6 +17,7 @@ ds = dataset()
 # --- Lancement -----------------------------------------------------------------------------
 st.subheader("Lancer le chargement")
 kwargs = {}
+# <synthétique>
 if ds == SYNTHETIC:
     default = SyntheticConfig()
     c = st.columns([2, 1, 1])
@@ -30,7 +31,8 @@ if ds == SYNTHETIC:
     st.caption(f"Jeu : `{variant_dir}` — {'existe déjà' if (variant_dir / 'payment.csv').exists() else 'à générer'}. "
                "Comptez ≈ 1 min 30 de génération et ≈ 2 min de chargement pour 2 M de paiements.")
     kwargs = {"n_payments": int(n_payments), "seed": int(seed), "regenerate": bool(regenerate)}
-else:
+# </synthétique>
+if ds != SYNTHETIC:
     st.caption(f"Sources décrites par `{schema_path()}` (page Configuration).")
 
 if st.button("Lancer l'étape 1", type="primary", icon=":material/play_arrow:", key="run_load"):

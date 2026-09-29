@@ -35,7 +35,12 @@ from src import memory, progress
 from src.config import DEFAULT_SCHEMA_PATH, DEFAULT_SETTINGS_PATH, REPO_ROOT, read_yaml, resolve_path
 from src.settings import DEFAULT_RULES_PATH, RulesConfig, Settings, load_rules, load_settings
 
+# Code propre au jeu synthétique : entre les marqueurs « <synthétique> », ou ligne marquée
+# « synthétique seulement ». La version portable (single/) le retire ; « portable: … » donne la ligne
+# qui y remplace la ligne marquée.
 SYNTHETIC, REAL = "synthetic", "real"
+DATASETS = (SYNTHETIC, REAL)  # portable: DATASETS = (REAL,)
+DEFAULT_DATASET = SYNTHETIC  # portable: DEFAULT_DATASET = REAL
 PERIOD_NAMES = ("train", "validation", "test", "all")
 MATCHERS = ("null", "rules", "pipeline")
 
@@ -55,19 +60,19 @@ def _clean(value: Any) -> Any:
 class Project:
     """Un jeu de données (synthétique ou réel) et ses fichiers de configuration."""
 
-    dataset: str = SYNTHETIC
+    dataset: str = DEFAULT_DATASET
     settings_path: Path = DEFAULT_SETTINGS_PATH
     schema_path: Path = DEFAULT_SCHEMA_PATH
     rules_path: Path = DEFAULT_RULES_PATH
     log: Callable[[str], None] = field(default=_stderr, repr=False)
 
     def __post_init__(self) -> None:
-        if self.dataset not in (SYNTHETIC, REAL):
-            raise ValueError(f"dataset : {SYNTHETIC!r} ou {REAL!r}")
+        if self.dataset not in DATASETS:
+            raise ValueError(f"dataset : {' ou '.join(map(repr, DATASETS))}")
         self.settings_path, self.schema_path, self.rules_path = (
             Path(self.settings_path), Path(self.schema_path), Path(self.rules_path))
-        if not progress.active():                  # progression dans le journal, sauf afficheur choisi
-            progress.use_log(self.log)
+        if not progress.chosen():                  # progression dans ce journal, sauf afficheur choisi
+            progress.use_log(self.log, automatic=True)
 
     # --- Configuration et chemins -------------------------------------------------------------------------
 
@@ -111,8 +116,23 @@ class Project:
 
     # --- Étape 1 : chargement ---------------------------------------------------------------------------------
 
-    def load(self, n_payments: int | None = None, seed: int = 42, regenerate: bool = False) -> dict:
-        """Charge les sources (ou génère le jeu synthétique), normalise, construit le journal et le profil."""
+    # <synthétique>
+    def _synthetic_source(self, n_payments: int | None, seed: int, regenerate: bool, timings: dict):
+        """Jeu synthétique (généré au besoin) : configuration de schéma, dossier source, libellé."""
+        from src.synthetic.generate import SyntheticConfig, write_synthetic
+        cfg = SyntheticConfig(seed=seed)
+        if n_payments:
+            cfg = replace(cfg, n_payments=n_payments)
+        # Un répertoire par variante : changer de volume n'écrase pas les autres jeux.
+        source_dir = resolve_path(self.settings.paths.synthetic_dir) / f"{cfg.n_payments}_seed{cfg.seed}"
+        if regenerate or not (source_dir / "payment.csv").exists():
+            with self._step(f"génération synthétique ({cfg.n_payments:,} paiements visés)", timings):
+                write_synthetic(cfg, source_dir)
+        return read_yaml(REPO_ROOT / "config" / "schema.synthetic.yaml"), source_dir, f"synthetic/{source_dir.name}"
+    # </synthétique>
+
+    def load(self, n_payments: int | None = None, seed: int = 42, regenerate: bool = False) -> dict:  # portable: def load(self) -> dict:
+        """Charge les sources, normalise, construit le journal et le profil."""
         from src.load.events import build_journal, derive_imputed_amounts, journal_hash
         from src.load.loader import load_all
         from src.load.normalize import NORMALIZATION_VERSION
@@ -121,19 +141,12 @@ class Project:
 
         settings = self.settings
         timings: dict[str, float] = {}
+        schema_cfg = None
+        # <synthétique>
         if self.dataset == SYNTHETIC:
-            from src.synthetic.generate import SyntheticConfig, write_synthetic
-            cfg = SyntheticConfig(seed=seed)
-            if n_payments:
-                cfg = replace(cfg, n_payments=n_payments)
-            # Un répertoire par variante : changer de volume n'écrase pas les autres jeux.
-            source_dir = resolve_path(settings.paths.synthetic_dir) / f"{cfg.n_payments}_seed{cfg.seed}"
-            if regenerate or not (source_dir / "payment.csv").exists():
-                with self._step(f"génération synthétique ({cfg.n_payments:,} paiements visés)", timings):
-                    write_synthetic(cfg, source_dir)
-            schema_cfg = read_yaml(REPO_ROOT / "config" / "schema.synthetic.yaml")
-            source = f"synthetic/{source_dir.name}"
-        else:
+            schema_cfg, source_dir, source = self._synthetic_source(n_payments, seed, regenerate, timings)
+        # </synthétique>
+        if schema_cfg is None:                     # sources réelles décrites par config/schema.yaml
             schema_cfg = read_yaml(self.schema_path)
             source_dir = resolve_path(schema_cfg.get("base_dir") or ".")
             source = str(self.schema_path)

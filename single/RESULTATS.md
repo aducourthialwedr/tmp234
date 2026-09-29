@@ -4,6 +4,9 @@ Ce document explique, pour chaque rapport de `reports/` et chaque métrique renv
 **ce qui est compté, sur quelle population, avec quel dénominateur, et par quel code**. `GUIDE.md`
 explique le fonctionnement du moteur ; ce document explique comment lire ce qu'il mesure.
 
+
+> Version portable : données réelles uniquement ; les rapports sont dans `reports/` (pas de sous-dossier `synthetic/`).
+
 ---
 
 ## 1. Les principes communs à tous les résultats

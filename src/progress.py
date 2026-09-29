@@ -154,10 +154,20 @@ def use_notebook() -> None:
     _REPORTER = NotebookReporter()
 
 
-def use_log(log: Callable[[str], None] = print, every: float = 30.0) -> None:
-    """Progression écrite dans un journal (console, interface), une ligne toutes les `every` secondes."""
+def use_log(log: Callable[[str], None] = print, every: float = 30.0, automatic: bool = False) -> None:
+    """Progression écrite dans un journal (console, interface), une ligne toutes les `every` secondes.
+
+    `automatic` : choix par défaut de `Project`, remplacé par le journal de chaque nouveau `Project` ;
+    un afficheur choisi explicitement (`use_notebook`, `use_log`) n'est jamais remplacé.
+    """
     global _REPORTER
     _REPORTER = LogReporter(log, every)
+    _REPORTER.automatic = automatic
+
+
+def chosen() -> bool:
+    """Un afficheur a-t-il été choisi explicitement ?"""
+    return _REPORTER is not None and not getattr(_REPORTER, "automatic", False)
 
 
 def disable() -> None:

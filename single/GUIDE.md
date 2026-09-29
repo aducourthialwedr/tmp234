@@ -8,6 +8,10 @@ Ce guide explique comment le moteur fonctionne, pourquoi il est construit ainsi,
 - `CLAUDE.md` : le brief (choix du POC, ordre des étapes) ;
 - `spec_rapprochement_automatique.md` : la spécification détaillée (features, formules).
 
+> **Version portable, données réelles uniquement.** Le générateur de données synthétiques et le
+> mode `dataset="synthetic"` n'y figurent pas : les passages du guide qui en parlent concernent le
+> dépôt complet.
+>
 > **Version en 4 fichiers.** `reconciliation.py` regroupe tout le code de `src/` : chaque section
 > y est précédée d'une bannière `src/<module>.py`, les chemins cités dans ce guide s'y retrouvent.
 > L'interface est `reconciliation_ui.py` (`streamlit run reconciliation_ui.py`), le notebook

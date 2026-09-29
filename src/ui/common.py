@@ -102,7 +102,7 @@ def current_settings() -> Settings:
 
 
 def dataset() -> str:
-    return st.session_state.get("dataset", SYNTHETIC)
+    return st.session_state.get("dataset", SYNTHETIC)  # portable: return REAL
 
 
 def interim_dir(settings: Settings | None = None, ds: str | None = None) -> Path:

@@ -46,7 +46,6 @@ from reconciliation import (
     Settings,
     SplitError,
     SplitSettings,
-    SyntheticConfig,
     TABLES,
     TABLE_NOTES,
     VALUE_MAP_FIELDS,
@@ -142,7 +141,7 @@ def current_settings() -> Settings:
 
 
 def dataset() -> str:
-    return st.session_state.get("dataset", SYNTHETIC)
+    return REAL
 
 
 def interim_dir(settings: Settings | None = None, ds: str | None = None) -> Path:
@@ -508,20 +507,7 @@ def page_load() -> None:
     # --- Lancement -----------------------------------------------------------------------------
     st.subheader("Lancer le chargement")
     kwargs = {}
-    if ds == SYNTHETIC:
-        default = SyntheticConfig()
-        c = st.columns([2, 1, 1])
-        n_payments = c[0].number_input("Paiements visés", min_value=1_000, max_value=5_000_000,
-                                       value=default.n_payments, step=100_000, key="load.n_payments",
-                                       help="Volume réel : environ 2 millions de paiements sur un an.")
-        seed = c[1].number_input("Seed", min_value=0, value=default.seed, step=1, key="load.seed")
-        regenerate = c[2].checkbox("Régénérer", key="load.regenerate",
-                                   help="Sinon, le jeu déjà généré pour ce volume et cette seed est réutilisé.")
-        variant_dir = resolve_path(settings.paths.synthetic_dir) / f"{int(n_payments)}_seed{int(seed)}"
-        st.caption(f"Jeu : `{variant_dir}` — {'existe déjà' if (variant_dir / 'payment.csv').exists() else 'à générer'}. "
-                   "Comptez ≈ 1 min 30 de génération et ≈ 2 min de chargement pour 2 M de paiements.")
-        kwargs = {"n_payments": int(n_payments), "seed": int(seed), "regenerate": bool(regenerate)}
-    else:
+    if ds != SYNTHETIC:
         st.caption(f"Sources décrites par `{schema_path()}` (page Configuration).")
 
     if st.button("Lancer l'étape 1", type="primary", icon=":material/play_arrow:", key="run_load"):
@@ -1172,8 +1158,6 @@ def main() -> None:
         "Mesure": [page("evaluation", page_evaluation)],
     })
     with st.sidebar:
-        st.radio("Jeu de données", options=[SYNTHETIC, REAL], key="dataset", horizontal=True,
-                 help="Synthétique : données générées (seed fixe). Réel : sources de config/schema.yaml.")
         meta = load_meta()
         if meta:
             st.caption(f"Dernier chargement : `{meta['source']}` · {meta['journal_events']:,} événements · "
