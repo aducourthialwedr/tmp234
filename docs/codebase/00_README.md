@@ -117,6 +117,8 @@ subtilités), `RESULTATS.md` (comment lire chaque rapport et chaque métrique), 
 **Pour exploiter les résultats** : `RESULTATS.md` à la racine du dépôt, puis
 [06_configuration_et_execution.md](06_configuration_et_execution.md).
 
+**Pour ajouter une règle de réconciliation** : [docs/ajouter_une_regle.md](../ajouter_une_regle.md).
+
 **Pour brancher les données réelles** : [06_configuration_et_execution.md](06_configuration_et_execution.md) §2
 (`config/schema.yaml`), [05_modules/load.md](05_modules/load.md), [03_gestion_des_donnees.md](03_gestion_des_donnees.md) §1.
 

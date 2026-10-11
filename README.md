@@ -49,7 +49,7 @@ Volumes indicatifs (16 cœurs) : 50 000 paiements ≈ 5 min de bout en bout ; 2 
 ## Paramètres
 
 - `config/settings.yaml` : un bloc par étape (découpage, allocation, ML, évaluation), commenté.
-- `config/rules.yaml` : les règles de l'étape 4, versionnées (activation, priorité, tolérances).
+- `config/rules.yaml` : les règles de l'étape 4, versionnées (activation, priorité, tolérances). Pour en ajouter une : [`docs/ajouter_une_regle.md`](docs/ajouter_une_regle.md).
 
 Modifiables à la main, depuis le notebook (`src.settings.load_settings` / `save_settings`) ou depuis
 l'interface.
