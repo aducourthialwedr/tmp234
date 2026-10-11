@@ -117,6 +117,8 @@ subtilités), `RESULTATS.md` (comment lire chaque rapport et chaque métrique), 
 **Pour exploiter les résultats** : `RESULTATS.md` à la racine du dépôt, puis
 [06_configuration_et_execution.md](06_configuration_et_execution.md).
 
+**Pour comprendre ou améliorer l'étape ML** : [docs/choix_etape_ml.md](../choix_etape_ml.md), puis le notebook `notebooks/exploration_ml.ipynb`.
+
 **Pour ajouter une règle de réconciliation** : [docs/ajouter_une_regle.md](../ajouter_une_regle.md).
 
 **Pour brancher les données réelles** : [06_configuration_et_execution.md](06_configuration_et_execution.md) §2

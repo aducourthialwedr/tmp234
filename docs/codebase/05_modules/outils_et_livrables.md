@@ -41,6 +41,10 @@ dépôt à `sys.path`.
 
 ---
 
+### 1 bis. `tools/make_ml_notebook.py` → `notebooks/exploration_ml.ipynb`
+
+Même principe (liste `CELLS`), pour un notebook d'**exploration ML** : structure des candidats et sources, pouvoir de chaque feature (AUC, top-1 par paiement), distributions, redondances, contributions SHAP, ablation par famille, gabarit de nouvelle feature, analyse d'erreurs, calibration, propositions et seuils. Il lit le jeu `data/interim/ml/dataset/`, le modèle et `validation_daily_proposals.parquet`. Il est écrit aussi en `single/exploration_ml.ipynb` : un repli d'import (`from reconciliation import ...`) le rend utilisable dans la version portable.
+
 ## 2. `tools/build_bundle.py` → `dist/reconciliation_poc.zip`
 
 `main()` (`tools/build_bundle.py:28`) zippe sous le préfixe `reconciliation_poc/` :

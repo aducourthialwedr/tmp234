@@ -10,6 +10,8 @@
 > - les seuils (`decide`), choisis sur la boucle de validation pour viser 99,5 % de précision.
 >
 > L'allocation et les règles sont des heuristiques à poids fixes, sans apprentissage.
+>
+> **Pourquoi** ces choix, alternatives et pistes : [docs/choix_etape_ml.md](../choix_etape_ml.md).
 
 ---
 
