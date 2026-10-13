@@ -45,6 +45,10 @@ dépôt à `sys.path`.
 
 Même principe (liste `CELLS`), pour un notebook d'**exploration ML** : structure des candidats et sources, pouvoir de chaque feature (AUC, top-1 par paiement), distributions, redondances, contributions SHAP, ablation par famille, gabarit de nouvelle feature, analyse d'erreurs, calibration, propositions et seuils. Il lit le jeu `data/interim/ml/dataset/`, le modèle et `validation_daily_proposals.parquet`. Il est écrit aussi en `single/exploration_ml.ipynb` : un repli d'import (`from reconciliation import ...`) le rend utilisable dans la version portable.
 
+### 1 ter. `tools/make_deep_dive_notebook.py` → `notebooks/deep_dive.ipynb`
+
+Support de revue technique : données canoniques et normalisation, journal, état daté et lot du jour, allocation d'une journée, règles, ML déroulé étape par étape sur un paiement (candidats, score, proposition, décision, contributions SHAP), rejeu court et évaluation, démonstration anti-fuite (journal tronqué → allocation identique), coût et mémoire. Environ 8 minutes sur le synthétique à 2 M de paiements ; option `PREPARE_DEMO` pour un jeu de 50 000 paiements.
+
 ## 2. `tools/build_bundle.py` → `dist/reconciliation_poc.zip`
 
 `main()` (`tools/build_bundle.py:28`) zippe sous le préfixe `reconciliation_poc/` :
