@@ -10,6 +10,9 @@
 > - des **points fragiles** (version portable générée hors dépôt, contrôles de version manuels) ;
 > - des **questions métier** qui conditionnent la validité des résultats sur données réelles.
 >
+> Les fuites de données de l'étape ML (apprentissage, sélection des seuils, attributs non datés,
+> indicateur principal) sont détaillées dans [docs/fuites_ml.md](../fuites_ml.md).
+>
 > Chaque point est référencé. « Certain » signifie vérifié dans le code ; « déduit » signifie
 > raisonné à partir du code, sans exécution sur données réelles.
 

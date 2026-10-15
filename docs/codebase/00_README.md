@@ -119,7 +119,7 @@ subtilités), `RESULTATS.md` (comment lire chaque rapport et chaque métrique), 
 
 **Pour une revue technique en direct** : `notebooks/deep_dive.ipynb` (un jour rejoué, un paiement suivi de l'allocation à la décision ML, évaluation, démonstration anti-fuite).
 
-**Pour comprendre ou améliorer l'étape ML** : [docs/choix_etape_ml.md](../choix_etape_ml.md), puis le notebook `notebooks/exploration_ml.ipynb`.
+**Pour comprendre ou améliorer l'étape ML** : [docs/choix_etape_ml.md](../choix_etape_ml.md), puis le notebook `notebooks/exploration_ml.ipynb`. Pour suivre l'apprentissage étape par étape (passe 1, plis, features de compétition, passe 2, calibration) sur un jeu de test synthétique : `notebooks/ml_pas_a_pas.ipynb` (généré par `tools/make_ml_steps_notebook.py`). Fuites de données relevées dans l'étape ML : [docs/fuites_ml.md](../fuites_ml.md).
 
 **Pour ajouter une règle de réconciliation** : [docs/ajouter_une_regle.md](../ajouter_une_regle.md).
 
