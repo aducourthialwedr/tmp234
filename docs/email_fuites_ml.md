@@ -1,37 +1,37 @@
-**Objet : Étape ML : ce que les folds OOF ne leakent pas, le leakage réel, et comment le corriger**
+**Objet : Leakage dans l'étape ML : pas de leakage grossier, un impact limité, et des correctifs pour le résiduel**
 
 Bonjour [Prénom],
 
-Suite à notre échange sur les folds du stacking, voici notre analyse. Pour chaque point, nous donnons d'abord le
-**raisonnement théorique** (ce que la construction garantit ou non), puis la **vérification empirique**. Celle-ci
-vient du notebook `notebooks/ml_pas_a_pas.ipynb`, qui refait `PairModel.fit` à la main, vérifie que le résultat est
-identique à celui du code (même `best_iteration`, mêmes scores, mêmes probabilités), puis ajoute des tests de
-leakage causaux.
+Merci pour votre retour sur l'étape ML et pour la question du leakage. L'intuition était bonne : un stacking en deux
+passes avec des folds OOF, sur des données temporelles, est exactement le genre de montage où le leakage se glisse.
+Nous avons donc instrumenté le training étape par étape. Le notebook `notebooks/ml_pas_a_pas.ipynb` refait
+`PairModel.fit` à la main, vérifie que le résultat est identique à celui du code (même `best_iteration`, mêmes scores,
+mêmes probabilités), puis ajoute des tests de leakage causaux.
 
-En bref :
+Notre conclusion tient en trois points :
 
-1. **Les folds OOF ne leakent pas le label.** Par construction, aucune paire n'est scorée par un modèle qui a vu un
-   label de son paiement, et aucun modèle de fold ne voit le validation set. Le notebook le confirme.
-2. **Il y a pourtant du leakage, mais ailleurs**, et la plupart du temps autour des folds plutôt que dans les
-   folds :
-   - le CV n'est pas temporel : le futur du train set entre dans les features de compétition (F4) ;
-   - un canal étroit va du validation set vers le train set, par le nombre d'itérations des modèles de fold ;
-   - le validation set sert à cinq choix successifs, puis à mesurer leur qualité (F1) ;
-   - les labels sont lus sans horizon (F3) ;
-   - des attributs statiques ne sont pas datés (F2). C'est probablement le leakage le plus coûteux sur les données
-     réelles.
-3. Tout cela a un correctif simple, sauf F2, qui dépend de l'historique disponible côté données. Vous les trouverez
-   au § 4.
+1. **Il n'y a pas de leakage grossier.** En particulier, les folds OOF ne leakent pas le label des paires, aucun
+   modèle ne voit le validation set pendant son training, et aucune feature ne contient d'information future. Le
+   raisonnement et les mesures sont au § 1.4.
+2. **L'impact du leakage restant est faible**, pour une raison structurelle : toutes nos évaluations finales se font
+   sur le **test set**, que le split temporel principal isole complètement. Il ne sert ni au training, ni à l'early
+   stopping, ni à la calibration, ni au choix des seuils. Un leakage d'apprentissage ou de sélection peut dégrader le
+   modèle ou rendre les métriques de validation optimistes, mais il ne peut pas gonfler la mesure sur le test (§ 1.5).
+3. **Il existe en revanche des leakages résiduels**, décrits au § 2.
+   - La plupart sont des leakages d'apprentissage ou de sélection, que la barrière du test neutralise.
+   - Deux d'entre eux, F2 et F5, sont des leakages **de données** : ils touchent aussi le replay du test, que le split
+     ne protège donc pas. Ce sont les premiers à mesurer sur les données réelles.
+   - Nos propositions d'évolution sont au § 3.
 
-**Précaution sur les chiffres.** Les mesures viennent du dataset synthétique (40 000 paiements, seed fixe),
-conformément à notre règle de ne pas développer sur les données réelles. Le validation set y compte 1 880 paiements
-avec au moins un positif, d'où une standard error d'environ **±0,5 pt** sur la precision@1. Le générateur n'a pas
-de drift et ses délais d'imputation sont courts : le leakage temporel y est **sous-estimé**. Nous rejouons le même
-notebook sur les données réelles (`DATASET = "real"`) ; c'est ce run qui tranchera.
+**Précaution sur les chiffres.** Sauf mention contraire, les mesures viennent du dataset synthétique (40 000
+paiements, seed fixe), conformément à notre règle de ne pas développer sur les données réelles. Le validation set y
+compte 1 880 paiements avec au moins un positif, d'où une standard error d'environ **±0,5 pt** sur la precision@1. Le
+générateur n'a pas de drift et ses délais d'imputation sont courts : le leakage temporel y est **sous-estimé**. Nous
+rejouons le même notebook sur les données réelles (`DATASET = "real"`) pour confirmer.
 
 ---
 
-## 1. Rappel du dispositif
+## 1. La pipeline actuelle, et pourquoi le leakage y pèse peu
 
 ### 1.1 Split temporel
 
@@ -44,7 +44,8 @@ section `split`). Sur le synthétique, bornes incluses :
 | validation | 2024-08-29 | 2024-10-28 | 61 | early stopping, calibration, seuils |
 | test | 2024-11-03 | 2025-01-02 | 61 | backtest complet, seuils figés, jamais vu |
 
-Le test set n'intervient ni dans le training ni dans le choix des seuils.
+Le replay d'apprentissage s'arrête à la fin de la validation. Le test set n'est lu qu'une fois, par le backtest final,
+avec un modèle et des seuils déjà figés.
 
 ### 1.2 Construction du dataset de paires
 
@@ -110,38 +111,24 @@ test        : backtest complet, seuils figés
 | `f₋ₖ = A(D₋ₖ)` | le modèle de fold k |
 | `g` | la fonction qui calcule rang, marge et meilleur concurrent à partir des scores d'un paiement |
 
----
+### 1.4 Pas de leakage grossier
 
-## 2. Pourquoi les folds ne leakent pas le label
+**a) Les folds OOF ne leakent pas le label.**
 
-### 2.1 Pas de stacking leakage
-
-**Théorie.**
+*Théorie.*
 - Le score OOF d'une paire du train vaut `s(p, j) = f₋ₖ₍ₚ₎(x_pj)`, et ses features de compétition valent
   `c_pj = g( s(p, ·) )_j`.
-- Le fold est tiré par paiement : toutes les paires de p sont dans le fold k(p). Le training set `D₋ₖ₍ₚ₎` de
-  `f₋ₖ₍ₚ₎` ne contient donc **aucun** label `y_p·`.
-- `c_pj` est ainsi une fonction de `x_p·` et de `D₋ₖ₍ₚ₎` seulement. Elle n'a aucun accès, direct ou indirect, aux
-  labels du paiement qu'elle décrit. C'est exactement la condition d'un stacking sans target leakage.
-- À l'inverse, en in-sample, `f(x_pj)` a été fit sur `y_pj` lui-même, et les marges seraient artificiellement
-  nettes.
+- Le fold est tiré par paiement : le training set `D₋ₖ₍ₚ₎` ne contient **aucun** label `y_p·`.
+- `c_pj` est donc une fonction de `x_p·` et de `D₋ₖ₍ₚ₎` seulement, sans accès, direct ou indirect, aux labels du
+  paiement qu'elle décrit. C'est exactement la condition d'un stacking sans target leakage.
 
 Deux conditions d'implémentation sont nécessaires, et elles sont remplies :
-1. **L'unité du fold doit coïncider avec l'unité d'agrégation de `g`**, c'est-à-dire le paiement. Sinon, le
-   « meilleur concurrent » d'une paire pourrait être scoré par un modèle qui a vu le label de ce concurrent, qui est
-   aussi un label du même paiement.
-2. **Aucun paiement ne doit apparaître sous deux groupes.** C'est garanti par l'enregistrement unique (`is_new`) :
-   un paiement en reliquat n'est pas réenregistré les jours suivants.
+- l'unité du fold coïncide avec l'unité d'agrégation de `g`, le paiement. Sinon, le « meilleur concurrent » d'une paire
+  pourrait être scoré par un modèle qui a vu son label ;
+- aucun paiement n'apparaît sous deux groupes, grâce à l'enregistrement unique (`is_new`).
 
-Une troisième condition porte sur le nombre d'itérations, fixé de l'extérieur : il ne doit pas dépendre de `y_p·`.
-C'est le cas, puisqu'il dépend du validation set. Mais cela ouvre un autre canal, traité au § 3.2.
-
-**Ce que la théorie ne garantit pas.** Elle garantit l'absence de leakage du label **de la paire**. Elle ne garantit
-pas que `s(p, ·)` suive la même distribution que le score de production. Pour cela, il faudrait que les paiements
-soient échangeables dans le temps, ce qui est faux. C'est l'objet du § 3.1.
-
-**Vérification empirique** (notebook, § 3 et § 4). Si les scores OOF contenaient le label, ils ressembleraient aux
-scores in-sample. Ils ressemblent en fait à ceux de la validation :
+*Vérification.* Si les scores OOF contenaient le label, ils ressembleraient aux scores in-sample. Ils ressemblent en
+fait à ceux de la validation (notebook, § 3 et § 4) :
 
 | Scoring (pass 1) | AUC | precision@1 | MRR | log-loss |
 |---|---|---|---|---|
@@ -149,345 +136,254 @@ scores in-sample. Ils ressemblent en fait à ceux de la validation :
 | train, OOF | 0,9964 | 0,945 | 0,966 | 0,0261 |
 | validation (pass 1 complète) | 0,9970 | 0,949 | 0,968 | 0,0224 |
 
-Pris un par un, chaque modèle de fold obtient 0,997 en in-sample, contre 0,942 à 0,949 sur le fold qu'il score, et
-0,947 à 0,948 sur le validation set. Les 4,6 points d'optimisme in-sample (0,991 contre 0,945) disparaissent.
+- Chaque modèle de fold obtient 0,997 en in-sample, contre 0,942 à 0,949 sur le fold qu'il score : les 4,6 points
+  d'optimisme in-sample disparaissent.
+- Les features de compétition ont des distributions proches entre le train et la validation : `rank_in_payment`
+  19,2 contre 19,7 en moyenne, `score_margin` −0,747 contre −0,728, médianes quasi identiques.
 
-Les features de compétition ont des distributions très proches entre le train et la validation :
+**b) Aucun modèle ne voit le validation set pendant son training.**
 
-| Feature | Moyenne train (OOF) | Moyenne validation |
-|---|---|---|
-| `rank_in_payment` | 19,2 | 19,7 |
-| `score_margin` | −0,747 | −0,728 |
-| `score_best_other` | 0,791 | 0,768 |
+*Théorie.* Les périodes sont disjointes par jour. Les modèles de fold sont fit sur des sous-ensembles du train set,
+sans early stopping. Côté validation, les features de compétition viennent de la pass 1 entraînée sur le train set
+seul.
 
-Les médianes sont quasi identiques.
+*Vérification* (notebook, § 4.3, tests T1 et T3) :
+- 0 paiement à la fois dans le train set et le validation set ;
+- 6 jours entre le dernier jour du train et le premier de la validation ;
+- 347 412 lignes vues par les 3 modèles de fold, soit 2 × 173 706, toutes du train set ;
+- 0 paire positive du train labellisée par une imputation datée de la validation ou après.
 
-**Attention.** Cette proximité ne suffit pas à exclure **tout** leakage, car deux effets jouent en sens opposés :
-- les modèles de fold ne voient que 2/3 du train set, ce qui rend les scores OOF plus pessimistes ;
-- ils voient le futur (§ 3.1), ce qui les rend plus optimistes.
+**c) Aucune information future dans les features.**
 
-Elle confirme seulement l'absence de leakage du label de la paire.
-
-### 2.2 Pas d'overlap entre le train et la validation
-
-**Théorie.**
-- Les périodes sont disjointes par jour, séparées par une purge.
-- Les modèles de fold sont fit sur des sous-ensembles de `D`, sans validation set. Ils n'ont pas d'early stopping.
-- Côté validation, les features de compétition viennent de la pass 1 entraînée sur `D` seul.
-
-Aucune ligne de validation n'entre donc dans un training des folds.
-
-**Vérification empirique** (notebook, § 4.3, tests T1 et T3) :
-
-| Test | Mesure |
-|---|---|
-| Paiements à la fois dans le train set et le validation set | 0 |
-| Gap entre le dernier jour du train et le premier jour de la validation | 6 jours (purge configurée : 5) |
-| Lignes vues à l'entraînement par les 3 modèles de fold | 347 412 = 2 × 173 706, toutes du train set |
-| Paires positives du train labellisées par une imputation datée de la validation ou après | 0 |
-
-### 2.3 Pas d'information future dans les features (hors attributs non datés)
-
-**Théorie.**
-- Toute lecture d'état passe par `LedgerState` avec un `as_of`. L'état n'avance que vers l'avant, en n'appliquant
-  que les événements antérieurs à `as_of`, et une lecture à une autre date que celle de l'état lève une
-  `TemporalError`.
-- `invoice.current_amount`, qui donnerait le solde final, est retiré au chargement. Le restant dû est reconstruit
-  par les imputations antérieures à D.
-- Les agrégats comportementaux sont calculés sur la fenêtre `[D − 180 j, D)`, strictement antérieure.
+*Théorie.*
+- Toute lecture d'état passe par `LedgerState` avec un `as_of`. L'état n'avance que vers l'avant, en n'appliquant que
+  les événements antérieurs à `as_of`, et une lecture à une autre date lève une `TemporalError`.
+- `invoice.current_amount` est retiré au chargement : le restant dû est reconstruit par les imputations antérieures.
+- Les agrégats comportementaux portent sur une fenêtre strictement antérieure, `[D − 180 j, D)`.
 - Les client files ne sont visibles qu'après leur `received_at`.
 
-Une feature calculée à D est donc une fonction du journal avant D, et elle est invariante si l'on retire les
-événements postérieurs.
+*Vérification* (notebook, § 8) :
+- **Truncation test.** On supprime du journal tout ce qui suit la fin de la validation, puis on reconstruit
+  l'intégralité du training set. On obtient les mêmes 238 846 paires, avec **les mêmes valeurs sur toutes les
+  features**. Seuls des labels changent (§ 2.4).
+- **Audit feature par feature.** La meilleure feature seule, `amount_rank_in_payment`, plafonne à 0,585 de
+  precision@1, contre 0,951 pour le modèle complet : aucune feature n'est un proxy du label.
 
-**Vérification empirique** (notebook, § 8).
-- **Truncation test.** On supprime du journal tout ce qui date du 2024-10-29 ou après, c'est-à-dire tout ce qui
-  suit la fin de la validation, puis on reconstruit l'intégralité du training set. On obtient les mêmes 238 846
-  paires, avec **les mêmes valeurs sur toutes les features**. Seuls les labels diffèrent (§ 3.4).
-- **Audit feature par feature.** On a entraîné un modèle par feature, seule. La meilleure est
-  `amount_rank_in_payment`, avec une precision@1 de 0,585, contre 0,951 pour le modèle complet. Aucune feature n'est
-  un proxy du label.
+Cette garantie a une limite : elle ne couvre pas les tables sans date (§ 2.5).
 
-Le truncation test ne couvre pas les tables sans date (§ 3.5).
+### 1.5 Pourquoi le leakage restant pèse peu
 
-**Un test non concluant.** Nous avons aussi lancé une adversarial validation sur les features de compétition. Le
-contrôle positif in-sample, qui leake franchement, n'est pas détecté (AUC 0,510). Le test n'est donc pas assez
-sensible, et nous ne nous appuyons pas dessus.
+**La barrière du test.** Le test set est isolé par le split principal, et les seuils sont figés avant de l'ouvrir. Un
+leakage qui intervient pendant le training ou la sélection (F1, F3, F4, nombre d'itérations des folds) a donc deux
+effets possibles, et seulement ceux-là :
+- un **modèle moins bon** que possible, ce qui se voit sur le test comme un taux d'automatisation plus bas, jamais plus
+  haut ;
+- des **métriques de validation optimistes**. C'est pourquoi nous ne communiquons que les chiffres du test.
+
+Les résultats de référence (synthétique, 2 M paiements) sont mesurés de cette façon, avec les seuils choisis sur la
+validation : 62,75 % d'automatisation avec les règles seules, 70,13 % avec règles + ML, à 99,61 % de précision.
+
+**Les ordres de grandeur mesurés sont dans le bruit :**
+
+| Leakage | Ce qui passe | Impact mesuré | Détail |
+|---|---|---|---|
+| F4 · CV non temporel | le futur du train, dans les features de compétition | la pass 2 entraînée sans futur fait au moins aussi bien (0,954 contre 0,948) | § 2.1 |
+| Itérations des folds | un entier, `best_iteration` | à itérations égales, les scores OOF sont identiques au bit près | § 2.2 |
+| F1 · validation réutilisée | des choix sur la validation | métriques de validation optimistes ; le test n'est pas touché | § 2.3 |
+| F3 · labels sans horizon | 56 labels de fin de validation | precision@1 0,951 contre 0,948 sans eux | § 2.4 |
+
+**La limite de cette barrière.** Elle ne protège pas contre un leakage **de données**, présent dans le journal
+lui-même : il touche le replay du test comme celui du train. C'est le cas de F2, les attributs non datés (§ 2.5), et de
+F5, les imputations datées avant leur paiement (§ 2.6). Le synthétique ne permet pas de les mesurer. Ce sont les
+priorités du run sur les données réelles.
 
 ---
 
-## 3. Le leakage réel
+## 2. Description du leakage résiduel
 
-### 3.1 F4 : le CV des folds n'est pas temporel
+Pour chaque leakage, nous donnons le mécanisme théorique, puis la vérification dans le notebook.
 
-**Théorie.** Un GroupKFold suppose les groupes **échangeables**, c'est-à-dire indépendants et identiquement
-distribués. Ce n'est pas le cas ici, pour deux raisons :
-- **Dépendance par débiteur.** Les paiements d'un même débiteur partagent des régularités. Les features `debtor_*`
-  (délai moyen, taux de partiels, taux de regroupement…), `bankroll_code`, `channel`, `market` et les signaux
+### 2.1 F4 : le CV des folds n'est pas temporel
+
+**Théorie.** Un GroupKFold suppose les groupes **échangeables**, ce qui n'est pas le cas ici, pour deux raisons :
+- **Dépendance par débiteur.** Les features `debtor_*`, `bankroll_code`, `channel`, `market` et les signaux
   d'allocation forment une quasi-empreinte du débiteur.
-- **Non-stationnarité.** La relation entre features et label dérive dans le temps : nouveaux débiteurs, nouveaux
-  libellés, changements de pratique.
+- **Non-stationnarité.** La relation entre features et label dérive dans le temps.
 
-Avec `hash(payment_id) mod 3`, un paiement de janvier est scoré par `f₋ₖ₍ₚ₎`, entraîné sur des paiements de février
-à août, dont ceux du même débiteur. L'**ensemble d'information** du score OOF est donc strictement plus large que
-celui dont dispose la pass 1 en production au moment du paiement, à savoir le passé seul.
+Avec `hash(payment_id) mod 3`, un paiement de janvier est scoré par un modèle de fold entraîné sur février à août,
+y compris sur les paiements du même débiteur. L'ensemble d'information du score OOF est donc plus large que celui dont
+dispose la pass 1 en production. Ce n'est pas un target leakage sur `y_p·`, mais un **look-ahead leakage**.
 
-Ce n'est pas un target leakage sur `y_p·`, mais un **look-ahead leakage** : il porte sur la relation features →
-label du futur.
+Ce leakage est confiné aux features de **training** de la pass 2. En validation, en test et en production, les
+features de compétition viennent de la pass 1 appliquée à des paiements postérieurs. Il ne peut que dégrader le
+modèle : la pass 2 apprend une relation marge → label plus favorable que celle qu'elle rencontrera.
 
-**Conséquences attendues.**
-- Les scores OOF du train sont plus optimistes que les scores de production, à volume égal.
-- La pass 2 apprend `P(y | marge, rang)` sous la mauvaise distribution. Elle surpondère `score_margin` et
-  `rank_in_payment`.
-- **Portée :** le leakage est confiné aux features de **training** de la pass 2. En validation, en test et en
-  production, les features de compétition viennent de la pass 1 entraînée sur le train set et appliquée à des
-  paiements postérieurs. F4 **ne gonfle donc pas** les métriques de test. Il dégrade le modèle, et donc le taux
-  d'automatisation atteignable.
-
-**Vérification empirique** (notebook, § 4.2 et § 6.1). On reproduit le scoring « comme en production » par un
-**walk-forward mensuel** en expanding window. Pour scorer le mois k, un modèle est entraîné uniquement sur :
-- les paires des paiements arrivés avant `Dₖ − purge` ;
+**Vérification** (notebook, § 4.2 et § 6.1). On reproduit le scoring « comme en production » par un **walk-forward
+mensuel** en expanding window. Pour scorer le mois k, un modèle est entraîné sur :
+- les paiements arrivés avant `Dₖ − purge` ;
 - avec les labels connus à `Dₖ` ;
-- en écartant les paiements dont l'issue est encore inconnue à `Dₖ`, plutôt que de les labelliser négatifs ;
-- au même nombre d'itérations que les modèles de fold, pour comparer à armes égales.
+- au même nombre d'itérations que les folds.
 
-Le premier mois n'a pas d'historique : il est exclu de la comparaison.
-
-| Scoring des paires du train (mêmes paires, hors premier mois) | AUC | precision@1 | log-loss |
-|---|---|---|---|
-| in-sample | 0,9997 | 0,990 | 0,0127 |
-| GroupKFold aléatoire, OOF (code actuel) | 0,9964 | 0,945 | 0,0258 |
-| walk-forward (sans futur) | 0,9920 | 0,931 | 0,0353 |
-| *validation, pour référence* | *0,9970* | *0,949* | *0,0224* |
-
-L'écart de 1,4 pt entre les deux mélange le futur et le **volume** : les premiers modèles walk-forward sont
-entraînés sur très peu de paires (1 292 pour le modèle qui score janvier, 9 167 pour février). On ne peut pas
-l'attribuer au seul futur.
-
-**Le test décisif est en aval** : on entraîne la pass 2 sur chacune des deux sources de scores, à paires
-identiques, puis on l'évalue sur le validation set.
+On entraîne ensuite la pass 2 sur chacune des deux sources de scores, à paires identiques, et on l'évalue sur la
+validation :
 
 | Pass 2, évaluée sur le validation set | precision@1 | MRR | log-loss |
 |---|---|---|---|
-| pass 1 seule, pour référence | 0,949 | 0,968 | 0,0224 |
-| GroupKFold aléatoire, tout le train set (code actuel) | 0,951 | 0,969 | 0,0207 |
 | GroupKFold aléatoire, mêmes paires que le walk-forward | 0,948 | 0,968 | 0,0207 |
 | walk-forward | 0,954 | 0,971 | 0,0201 |
 
-Le walk-forward fait **au moins aussi bien** : +0,6 pt de precision@1, soit environ 1,2 standard error, avec une
-meilleure log-loss. Le mécanisme prédit par la théorie est réel, mais son coût n'est pas détectable sur le
-synthétique, qui n'a ni drift ni dépendance forte par débiteur. La correction ne coûte rien en performance. Sur les
-données réelles, nous attendons un écart plus net.
+Le walk-forward fait au moins aussi bien : +0,6 pt, soit environ 1,2 standard error. Le mécanisme est réel, son coût
+n'est pas détectable sur le synthétique, et la correction ne coûte rien. Avec du drift, nous attendons un écart plus
+net.
 
-**Remarque hors leakage.** Les modèles de fold voient 2/3 du train set, au même nombre d'itérations que la pass 1
-complète qui score la validation. Les échelles de score diffèrent donc légèrement entre le training et l'inférence de
-la pass 2. C'est un distribution shift, que le walk-forward réduit aussi : son dernier modèle est proche du modèle
-de production.
+Au niveau des scores OOF eux-mêmes (precision@1 de 0,945 en aléatoire contre 0,931 en walk-forward), l'écart mélange
+le futur et le volume : les premiers modèles walk-forward voient très peu de paires.
 
-### 3.2 Un canal validation → train : le nombre d'itérations des modèles de fold
+### 2.2 Un canal validation → train : le nombre d'itérations des folds
 
-**Théorie.**
-- Les modèles de fold ne voient aucune ligne de validation (§ 2.2). Mais `A` est paramétré par
-  `n_iter = max(pass1.best_iteration, 10)` (`model.py:121`).
-- `best_iteration` est l'argmin de la loss de validation sur le chemin d'early stopping. C'est donc une fonction des
-  labels de validation.
-- Par composition, `s(p, j) = A_{n_iter(V)}(D₋ₖ₍ₚ₎)(x_pj)` dépend du validation set.
+**Théorie.** Les modèles de fold ne voient aucune ligne de validation, mais leur nombre d'itérations vaut
+`max(pass1.best_iteration, 10)` (`model.py:121`). `best_iteration` dépend des labels de validation par l'early
+stopping. Les scores OOF, donc les features de compétition du train, dépendent ainsi du validation set, qui sert ensuite
+à l'early stopping de la pass 2 et à la calibration.
 
-Le canal ne fait passer qu'un entier, mais il existe. Et ce même validation set sert ensuite à l'early stopping de
-la pass 2 et à la calibration.
+**Vérification** (notebook, § 4.3, test T4) : deux tests causaux.
+- **Contrôle.** Avec le même nombre d'itérations, les folds refaits donnent des scores OOF identiques au bit près :
+  c'est le **seul** canal.
+- **Shuffle des labels de validation.** L'early stopping s'arrête à 10 itérations au lieu de 195, les scores OOF
+  changent de 0,051 en moyenne, et leur precision@1 passe de 0,945 à 0,915 : le canal est actif.
 
-**Vérification empirique** (notebook, § 4.3, test T4) : deux tests causaux.
+C'est un leakage faible, puisqu'un seul entier passe.
 
-| Variante | Itérations des modèles de fold | Écart moyen des scores OOF | precision@1 OOF |
-|---|---|---|---|
-| référence | 195 | — | 0,945 |
-| contrôle : mêmes itérations, folds refaits | 195 | 0,0000 (écart max 0) | 0,945 |
-| labels du validation set shufflés | 10 | 0,051 (écart max 0,91) | 0,915 |
+### 2.3 F1 : le validation set sert à choisir, puis à mesurer
 
-- **Le contrôle** montre que `n_iter` est le **seul** canal : le training est déterministe, et à itérations égales
-  les scores OOF sont identiques au bit près.
-- **Le shuffle des labels** montre que ce canal est actif : quand le validation set ne porte plus aucune
-  information, l'early stopping s'arrête à 10 itérations et les features de compétition du train changent.
+**Théorie.** Le même validation set sert à cinq choix :
+1. l'early stopping de la pass 1 ;
+2. le nombre d'itérations des folds ;
+3. l'early stopping de la pass 2 ;
+4. le fit de l'isotonique ;
+5. les seuils τ_high.
 
-### 3.3 F1 : le validation set sert à choisir, puis à mesurer
+Les métriques de validation qu'on en tire sont biaisées vers le haut. La « précision des auto-validations » vaut même au
+moins 99,5 % par construction.
 
-**Théorie.** Le même validation set sert, dans l'ordre :
-1. à l'early stopping de la pass 1 ;
-2. au nombre d'itérations des modèles de fold (§ 3.2) ;
-3. à l'early stopping de la pass 2 ;
-4. au fit de la régression isotonique ;
-5. au choix des seuils τ_high par type de proposition.
+Le point le plus sensible est τ_high, car il relève du **winner's curse** :
+- `calibrate_online` retient le seuil le plus permissif dont la precision observée atteint la cible, sur au moins
+  `MIN_KIND_VOLUME = 20` propositions (`src/reconcile_ml/decision.py:27`) ;
+- une tranche de 20 propositions dont la vraie precision n'est que de 98 % passe ce test avec une probabilité de
+  0,98²⁰ ≈ 67 % ;
+- la precision sur le test peut donc tomber sous la cible, surtout pour les types à faible volume.
 
-On reporte ensuite, sur ces mêmes données, l'AUC, la precision@1, la reliability curve et la « précision des
-auto-validations ». Une métrique mesurée sur les données qui ont servi à la sélection est biaisée vers le haut : la
-dernière vaut même au moins 99,5 % **par construction**.
+Le test le mesure honnêtement, mais c'est un risque sur la tenue de l'engagement de 99,5 %.
 
-**Le point le plus sensible est τ_high**, car c'est un **winner's curse**.
-- `calibrate_online` retient le seuil **le plus permissif** dont la precision observée atteint la cible, sur au
-  moins `MIN_KIND_VOLUME = 20` propositions (`src/reconcile_ml/decision.py:27`).
-- On prend ainsi le maximum, sur environ 2 000 seuils, d'une quantité bruitée : `E[precision réelle | seuil choisi]`
-  est inférieure à la precision observée.
-- À 99,5 %, une tranche de 20 à 199 propositions doit être correcte à 100 %. Une tranche de 20 propositions
-  dont la vraie precision n'est que de 98 % passe ce test avec une probabilité de 0,98²⁰ ≈ 67 %.
-- La precision attendue sur le test set est donc inférieure à la cible, surtout pour les types à faible volume
-  (`partial`, `set`).
+**Vérification** (notebook, § 6.2). Nous avons coupé la validation en deux : fit de l'isotonique sur V1, évaluation sur
+V2. La log-loss sur V2 vaut 0,02115 avec l'isotonique, contre 0,02081 avec les scores bruts : la calibration
+**dégrade** la log-loss out-of-sample. Elle écrase aussi les 5 % de scores les plus hauts en 17 valeurs distinctes. La
+décision travaille déjà sur le score brut. Le biais sur τ_high n'est pas mesuré par le notebook : il le sera sur le test,
+seuils actuels contre seuils corrigés.
 
-**Vérification empirique.**
-- **Calibration** (notebook, § 6.2). Nous avons coupé le validation set en deux : fit sur V1, évaluation sur V2.
-
-  | Scores | log-loss sur V2 |
-  |---|---|
-  | bruts | 0,02081 |
-  | isotoniques, fit sur V1 | 0,02115 |
-
-  - **Out-of-sample, l'isotonique dégrade la log-loss** : LightGBM, entraîné en log-loss, est déjà bien calibré.
-    La reliability curve in-sample, presque parfaite, ne prouvait donc rien.
-  - L'isotonique écrase aussi les 5 % de scores les plus hauts en **17 valeurs distinctes**, contre 2 944 en brut.
-    C'est pourquoi la décision travaille déjà sur le score brut.
-- **τ_high.** Le notebook ne mesure pas ce biais : il s'arrête avant la décision. La mesure se fera sur le test, en
-  comparant la precision obtenue par type aux seuils actuels et aux seuils corrigés (§ 4, point 4).
-
-### 3.4 F3 : des labels lus sans horizon
+### 2.4 F3 : des labels lus sans horizon
 
 **Théorie.**
-- `label_pairs` calcule `y_pj = 1{(p, j) ∈ imputation}` sur **toute** la table, sans condition sur `updated_at`.
-- Le label d'un paiement de fin de période utilise donc de l'information postérieure à la fin de la période :
-  pendant la purge, pendant le test, ou après.
-- La purge ne joue pas son rôle : elle dure 5 jours, alors qu'un paiement reste en reliquat jusqu'à 60 jours et
-  que l'imputation manuelle prend souvent plusieurs semaines.
-- **Biais de sélection.** À la date T d'un retrain en production, l'issue des paiements récents est inconnue. Ici,
-  les paiements difficiles, qui sont imputés tard, sont labellisés **grâce** au futur. Le training set est donc plus
-  informé que celui d'un retrain réel, précisément sur les cas les plus difficiles.
+- `label_pairs` labellise à partir de toute la table `imputation`, sans condition sur `updated_at`.
+- Un paiement de fin de période reçoit donc son label final, même s'il a été prononcé plus tard. La purge de 5 jours
+  est courte face à une imputation manuelle qui prend souvent plusieurs semaines.
+- Il y a aussi un biais de sélection. À la date d'un retrain réel, l'issue des paiements récents est inconnue ; ici,
+  les paiements difficiles, imputés tard, sont labellisés grâce au futur.
 
-**Vérification empirique** (notebook, § 8.1, même truncation test qu'au § 2.3).
-- Les paires et les features sont identiques, mais **56 labels basculent**. Tous concernent des paiements des
-  derniers jours de la validation, imputés après sa fin.
-- Le modèle entraîné avec l'après-validation atteint 0,951 de precision@1, contre 0,948 sans : l'écart est dans le
-  bruit.
-- Sur le synthétique, les délais d'imputation ne dépassent pas 3 jours (P95 : 3 jours). Ces labels viennent donc de
-  la purge et non du test, et c'est aussi pourquoi aucun label du train set ne vient de la validation (§ 2.2).
+**Vérification** (notebook, § 8.1, truncation test du § 1.4).
+- Les paires et les features sont identiques, mais **56 labels basculent**, tous sur des paiements des derniers jours
+  de la validation.
+- Le modèle entraîné avec ces labels atteint 0,951 de precision@1, contre 0,948 sans : l'écart est dans le bruit.
 
-Sur les données réelles, le chiffre à regarder est le **P95 du délai entre l'arrivée du paiement et son
-imputation** : s'il dépasse la purge, F3 devient significatif.
+Sur le synthétique, le P95 du délai d'imputation est de 3 jours. Sur les données réelles, c'est ce délai qui dira si F3
+compte : s'il dépasse la purge, l'effet grandit.
 
-### 3.5 F2 : des attributs statiques non datés, probablement le leakage le plus coûteux en réel
+### 2.5 F2 : des attributs statiques non datés (leakage de données)
 
 **Théorie.**
-- Plusieurs informations n'ont pas de date et sont visibles dès le premier jour du replay, dans l'état où elles ont
-  été **extraites**, c'est-à-dire en fin d'historique :
-  - tous les IBAN d'une partie (`party_iban`) ;
-  - les variantes de nom ;
-  - le référentiel des comptes techniques ;
-  - les champs de facture (`client_reference`, `debtor_id`, `due_date`, `agreement_id`) ;
-  - les attributs de contrat.
-- En affacturage, le référentiel se complète souvent **à partir des paiements eux-mêmes**. Un gestionnaire rapproche
-  à la main un virement venu d'un IBAN inconnu, puis rattache cet IBAN au débiteur. Dans le replay, l'IBAN est alors
-  connu **avant** le paiement qui l'a fait découvrir.
-- Pour ce paiement, `alloc_sig_iban` ou `iban_route = DEBTOR_DIRECT` est en partie un **label déguisé** : un
-  target leakage au sens strict. En production, à l'inverse, les IBAN encore inconnus sont précisément ceux des
-  paiements difficiles.
+- Plusieurs informations sont visibles dès le premier jour du replay, dans l'état où elles ont été extraites en fin
+  d'historique : les IBAN des parties (`party_iban`), les variantes de nom, les comptes techniques, les champs de facture
+  et les attributs de contrat.
+- En affacturage, le référentiel se complète souvent à partir des paiements eux-mêmes. Un IBAN découvert lors d'un
+  rapprochement manuel est alors connu **avant** le paiement qui l'a révélé.
+- Pour ce paiement, `alloc_sig_iban` ou `iban_route = DEBTOR_DIRECT` est en partie un label déguisé.
+- **Ce leakage touche aussi le replay du test** : la barrière du § 1.5 ne le neutralise pas.
 
-**Vérification empirique : pas encore possible.**
-- Le truncation test ne peut pas voir ce leakage : sans date, ces tables ne sont pas tronquées (`party_iban` garde
-  ses 938 lignes).
-- Le synthétique ne le simule pas : son référentiel est complet dès le départ.
+**Vérification : pas encore possible.** Le truncation test ne peut pas le voir, puisque ces tables n'ont pas de date
+(`party_iban` garde ses 938 lignes). Le synthétique ne le simule pas non plus. Une mesure dédiée est prévue sur les
+données réelles (§ 3, point 5).
 
-Il faut une mesure dédiée sur les données réelles (§ 4, point 5).
+### 2.6 Leakage secondaire
 
-### 3.6 Leakage secondaire
-
-- **F5 : imputation datée avant l'arrivée de son paiement.**
-  - Le journal place l'imputation à `updated_at` et le paiement à sa date de valeur (ou de comptabilisation).
-  - Si la première précède la seconde, l'état figé au jour d'arrivée contient déjà l'imputation : restant dû
-    réduit, agrégats du débiteur qui l'incluent.
-  - Le rapport de chargement compte ces cas (`avant_connaissance_du_paiement`) mais ne les corrige pas.
-- **F6 : le KPI affiché en tête choisit son seuil sur le test set.**
-  - `taux_automatisation_à_précision_cible` est le point de la precision curve du test le plus à droite au-dessus
-    de la cible : c'est un seuil oracle, donc un plafond a posteriori.
-  - Le résultat légitime est `taux_automatisation`, obtenu avec les seuils de validation.
-  - C'est une question de reporting ; le modèle n'est pas en cause.
-- **F7 : vocabulaires de catégories construits sur toutes les données.** Cela concerne `channel`, `bankroll_code`,
-  `market`, `product` et `recourse`. L'effet théorique est faible, et le truncation test ne montre aucun
-  changement d'encodage.
+- **F5 : imputation datée avant l'arrivée de son paiement** (leakage de données).
+  - Si `updated_at` précède la date de valeur du paiement, l'état figé à son arrivée contient déjà l'imputation.
+  - Cela touche aussi le test.
+  - Le rapport de chargement compte ces cas (`avant_connaissance_du_paiement`), sans les corriger.
+- **F6 : un KPI de l'interface choisit son seuil sur le test.**
+  - `taux_automatisation_à_précision_cible` est un seuil oracle.
+  - Les chiffres que nous communiquons sont ceux obtenus avec les seuils de validation (`taux_automatisation`), mais
+    l'interface affiche l'oracle en premier.
+- **F7 : vocabulaires de catégories construits sur toutes les données.** L'effet est faible, et le truncation test ne
+  montre aucun changement d'encodage.
 
 ---
 
-## 4. Correctifs proposés, par ordre de priorité
+## 3. Propositions d'évolution
 
-1. **Labelliser avec un horizon (F3).** C'est le prérequis des autres correctifs.
+Les correctifs sont classés par priorité.
+
+1. **Labelliser avec un horizon (F3).** C'est le prérequis des autres.
    - Labels à la date de cutoff C : seules les imputations avec `updated_at < C` comptent.
-   - Un paiement sans issue connue à C et plus récent que `retention_days` est **écarté**, et non labellisé négatif.
-     Le labelliser négatif remplacerait un leakage par du label noise.
-   - Purge ≥ P95 du délai arrivée → imputation, mesuré sur le train set.
+   - Un paiement sans issue connue à C et plus récent que `retention_days` est écarté, et non labellisé négatif, pour ne
+     pas remplacer un leakage par du label noise.
+   - Purge ≥ P95 du délai entre l'arrivée du paiement et son imputation.
 
 2. **Remplacer le GroupKFold aléatoire par un walk-forward (F4).**
-   - Retrain aux dates D₀ < D₁ < …, à la cadence prévue en production (mensuelle), en expanding window.
-   - Le modèle entraîné à Dₖ voit les paiements arrivés avant `Dₖ − purge`, avec les labels connus à Dₖ (point 1),
-     et score `[Dₖ, Dₖ₊₁)`. Le score OOF a alors le même ensemble d'information qu'en production.
-   - **Aucun nouveau replay n'est nécessaire.** Les features de pass 1 ne dépendent pas du modèle, et
-     `DatasetRecorder` ne décide que par les règles. Le dataset enregistré, avec sa colonne `day`, contient donc déjà
-     tout ce que la boucle aurait vu.
-   - Coût, d'après le notebook : la somme des tailles de training est d'environ 451 000 paires, contre 347 000 pour
-     les 3 modèles de fold actuels, soit environ 1,3 fois le coût actuel du CV.
-   - Le premier mois, qui n'a pas de score, est exclu de la pass 2, ou traité comme un rang manquant.
-   - Fallback, moins juste : un GroupKFold par **débiteur**. Il coupe la dépendance par débiteur, mais ne traite ni le
-     drift ni l'horizon des labels.
+   - Retrain mensuel en expanding window : le modèle entraîné à Dₖ voit les paiements arrivés avant `Dₖ − purge`, avec
+     les labels connus à Dₖ, et score `[Dₖ, Dₖ₊₁)`.
+   - Aucun nouveau replay n'est nécessaire : les features de pass 1 ne dépendent pas du modèle, et le dataset enregistré
+     contient déjà la colonne `day`.
+   - Coût : environ 451 000 paires cumulées, contre 347 000 pour les 3 folds actuels, soit à peu près 1,3 fois.
+   - Fallback : un GroupKFold par débiteur, moins juste.
 
-3. **Fixer le nombre d'itérations sans le validation set (§ 3.2).**
-   - Early stopping interne au train set, sur son dernier mois après purge (inner holdout temporel) ;
-   - ou nombre d'itérations choisi à l'intérieur du walk-forward.
-   - Le validation set ne modifie alors plus aucune feature du train set.
+3. **Fixer le nombre d'itérations sans la validation (§ 2.2).** Early stopping interne au train, sur son dernier mois
+   après purge, ou choisi dans le walk-forward.
 
-4. **Séparer les rôles du validation set (F1).**
-   - **V1** pour l'early stopping des deux passes, **V2** pour les seuils.
-   - Ne reporter comme « out-of-sample » que des métriques calculées sur une période qui n'a servi à aucun choix.
-   - Choisir τ_high sur une **lower bound** de la precision plutôt que sur la precision observée. Avec Clopper-Pearson
-     à 95 %, une lower bound ≥ 99,5 % impose environ 600 propositions toutes correctes
-     (`n ≥ ln 0,05 / ln 0,995 ≈ 598`). Relever `MIN_KIND_VOLUME` en conséquence.
-   - Retirer l'isotonique du chemin de décision, ce qui est déjà le cas, ou la remplacer par du Platt scaling pour
-     l'affichage.
-   - Si V1 et V2 font un mois chacun, vérifier le volume par type de proposition ; au besoin, étendre la validation à
-     trois mois.
+4. **Séparer les rôles de la validation (F1).**
+   - V1 pour l'early stopping, V2 pour les seuils.
+   - τ_high choisi sur une lower bound de Clopper-Pearson plutôt que sur la precision observée. Une borne ≥ 99,5 % à
+     95 % impose environ 600 propositions toutes correctes (`n ≥ ln 0,05 / ln 0,995 ≈ 598`) ; relever
+     `MIN_KIND_VOLUME` en conséquence.
+   - Isotonique réservée à l'affichage, ou remplacée par du Platt scaling.
+   - Au besoin, étendre la validation à 3 mois.
 
 5. **Dater les attributs statiques (F2).**
-   - Demander à l'équipe données si `party_iban`, les noms et les champs de facture ont un historique (date d'ajout ou
-     de modification). Si oui, en faire des événements du journal (`PARTY_IBAN_ADDED`…).
-   - Sinon, estimer la date d'apparition d'un IBAN par le premier paiement imputé au débiteur depuis cet IBAN, et ne
-     le rendre visible qu'à partir de ce jour.
-   - **Mesure d'impact** : rejouer le test sans le signal IBAN pour les couples (débiteur, IBAN) dont le premier
-     paiement imputé est postérieur à D, puis comparer le taux d'automatisation et la precision.
+   - Récupérer l'historique de `party_iban`, des noms et des champs de facture s'il existe, et en faire des événements du
+     journal.
+   - Sinon, estimer la date d'apparition d'un IBAN par le premier paiement imputé depuis cet IBAN.
+   - **Mesure d'impact** : rejouer le test sans le signal IBAN pour les couples (débiteur, IBAN) découverts après D.
 
 6. **Leakage secondaire.**
-   - F5 : rendre le contrôle bloquant au-delà d'un seuil, ou décaler l'imputation à
-     `max(updated_at, arrivée du paiement + ε)`.
-   - F6 : afficher en tête le taux obtenu avec les seuils de validation, et intituler la courbe « plafond a
-     posteriori (seuil oracle) ».
-   - F7 : construire les vocabulaires sur le seul train set.
+   - F5 : contrôle bloquant au-delà d'un seuil, ou décalage de l'imputation à `max(updated_at, arrivée + ε)`.
+   - F6 : afficher en tête le taux obtenu avec les seuils de validation.
+   - F7 : vocabulaires construits sur le seul train set.
 
-7. **Automatiser le contrôle.** Ajouter un test anti-leakage du **training**, et pas seulement de l'inférence :
-   - construire le training set sur le journal complet et sur le journal tronqué à la fin de la validation, en
-     tronquant aussi les attributs une fois datés ;
-   - les features doivent être identiques, et les labels aussi une fois l'horizon appliqué.
-
-   Le test anti-leakage actuel rejoue un modèle déjà entraîné sur un journal tronqué : il ne couvre ni le training,
-   ni les tables non datées.
+7. **Automatiser le contrôle.** Ajouter un test anti-leakage du **training** :
+   - même training set sur le journal complet et sur le journal tronqué, attributs datés compris ;
+   - mêmes features, et mêmes labels une fois l'horizon appliqué.
 
 Les points 1 à 4 sont locaux à `model.py`, `pipeline.py` et `decision.py`. Nous proposons de les implémenter en
-premier, puis de comparer, **sur le test set**, le taux d'automatisation à precision fixée avant et après
-correction. Le point 5 dépend de la réponse de l'équipe données.
+premier, puis de comparer sur le test le taux d'automatisation à precision fixée, avant et après correction. Le point 5
+dépend de l'historique disponible côté données.
 
-## 5. Mesures en cours sur les données réelles
+Sur les données réelles, nous suivrons en priorité :
+- le P95 du délai d'imputation et le nombre de labels qui basculent au truncation test (F3) ;
+- l'écart walk-forward / GroupKFold sur la pass 2 (F4) ;
+- l'ablation IBAN (F2) ;
+- le compte `avant_connaissance_du_paiement` (F5).
 
-Nous rejouons le même notebook sur les données réelles, en suivant en priorité :
-1. le P95 du délai entre l'arrivée du paiement et son imputation, et le nombre de labels qui basculent au truncation
-   test (F3) ;
-2. l'écart entre la pass 2 « GroupKFold aléatoire » et la pass 2 « walk-forward » (F4) ;
-3. le test sans signal IBAN pour les IBAN découverts après coup (F2) ;
-4. le compte `avant_connaissance_du_paiement` (F5).
-
-Je vous envoie les résultats dès qu'ils sont disponibles. Si vous voulez examiner un point en détail, le notebook
-déroule chaque étape avec ses sorties intermédiaires, et `docs/fuites_ml.md` détaille chaque leakage avec les
-références de code.
+Je vous envoie les résultats dès qu'ils sont disponibles. Le notebook déroule chaque étape avec ses sorties
+intermédiaires, et `docs/fuites_ml.md` détaille chaque leakage avec ses références de code.
 
 Bien à vous,
 
