@@ -162,6 +162,19 @@ reconcile_ml:
     min_data_in_leaf: 50
     # Graine (reproductibilité).
     seed: 42
+    # Scores de pass 1 du train qui nourrissent les features de compétition de la pass 2.
+    # walk_forward : chaque mois est scoré par un modèle appris sur le seul passé, avec les labels
+    # connus à cette date, comme en production. random_folds : version précédente, 3 folds tirés
+    # par paiement (un modèle de fold voit le futur du train : fuite F4, docs/fuites_ml.md).
+    oof_scheme: walk_forward
+    # Walk-forward : un modèle tous les N mois, qui score les N mois suivants. N plus grand =
+    # apprentissage plus rapide.
+    walk_forward_step_months: 1
+    # Walk-forward : fenêtre d'apprentissage glissante, en mois. Vide = tout le passé disponible.
+    walk_forward_window_months:
+    # Walk-forward : paires positives minimales pour entraîner un modèle. Les mois sans modèle sont
+    # exclus de la pass 2.
+    walk_forward_min_positives: 50
     # Threads LightGBM (apprentissage et score). 0 = CPU utilisables du pod (quota cgroup), et non
     # les cœurs de la machine hôte.
     num_threads: 0

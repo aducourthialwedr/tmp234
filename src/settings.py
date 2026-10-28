@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -183,6 +184,17 @@ class TrainingSettings(_Model):
     num_leaves: int = Field(63, ge=2, description="Feuilles par arbre.")
     min_data_in_leaf: int = Field(50, ge=1, description="Observations minimales par feuille.")
     seed: int = Field(42, description="Graine (reproductibilité).")
+    oof_scheme: Literal["walk_forward", "random_folds"] = Field(
+        "walk_forward", description="Scores de pass 1 du train qui nourrissent les features de compétition de la "
+        "pass 2. walk_forward : chaque mois est scoré par un modèle appris sur le seul passé, avec les labels "
+        "connus à cette date, comme en production. random_folds : version précédente, 3 folds tirés par "
+        "paiement (un modèle de fold voit le futur du train : fuite F4, docs/fuites_ml.md).")
+    walk_forward_step_months: int = Field(1, ge=1, description="Walk-forward : un modèle tous les N mois, qui "
+                                          "score les N mois suivants. N plus grand = apprentissage plus rapide.")
+    walk_forward_window_months: int | None = Field(None, ge=1, description="Walk-forward : fenêtre "
+                                                   "d'apprentissage glissante, en mois. Vide = tout le passé disponible.")
+    walk_forward_min_positives: int = Field(50, ge=1, description="Walk-forward : paires positives minimales "
+                                            "pour entraîner un modèle. Les mois sans modèle sont exclus de la pass 2.")
 
 
 class DecisionSettings(_Model):

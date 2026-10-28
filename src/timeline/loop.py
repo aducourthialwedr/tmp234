@@ -102,11 +102,13 @@ class DailyIterator:
         state = self.state
         # Reliquat initial : paiements arrivés dans la fenêtre de rétention avant `start`.
         warm = self.start - pd.Timedelta(days=self.retention_days)
+        memory.mark("état · reconstruction jusqu'au début du replay")
         state.advance_to(warm)
         self._pending, self._first_day = state.payments_arriving(warm, self.start)
 
         day = self.start
         while day <= self.end:
+            memory.mark("état · avance d'un jour, lot du jour")
             state.advance_to(day)
             today = _to_us(day) // DAY_US
             new, _ = state.payments_arriving(day, day + pd.Timedelta(days=1))
@@ -172,8 +174,9 @@ def run_replay(state: LedgerState, matcher: Matcher, start: date, end: date, ret
 
     `label` : nom de la tâche dans le suivi de progression (`src/progress.py`).
     """
-    with progress.task(label or f"rejeu {getattr(matcher, 'name', 'rapprocheur')}",
-                       (pd.Timestamp(end) - pd.Timestamp(start)).days + 1, "jours") as task:
+    name = label or f"rejeu {getattr(matcher, 'name', 'rapprocheur')}"
+    memory.mark_step(name)                             # étape du suivi mémoire et du profil de temps
+    with progress.task(name, (pd.Timestamp(end) - pd.Timestamp(start)).days + 1, "jours") as task:
         return _run_replay(state, matcher, start, end, retention_days, on_day, task)
 
 
@@ -184,7 +187,9 @@ def _run_replay(state, matcher, start, end, retention_days, on_day, task) -> Rep
     for ctx in it:
         t = time.perf_counter()
         memory.mark_day(ctx.day, len(ctx.batch))
-        dec = _validate(matcher.process(ctx), ctx)
+        dec = matcher.process(ctx)
+        memory.mark("boucle · contrôle anti-fuite, bilan du jour")
+        dec = _validate(dec, ctx)
         it.resolve(dec.loc[dec["action"] == AUTO, "payment_id"].unique())
         if len(dec):
             frames.append(dec.assign(day=ctx.day))

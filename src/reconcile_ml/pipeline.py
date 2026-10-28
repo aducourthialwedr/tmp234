@@ -162,6 +162,7 @@ class PipelineMatcher(_ResidualMixin):
                 "day": ctx.day, "payment_id": batch_ids[props["row"].to_numpy()], "kind": props["kind"].to_numpy(),
                 "score": props["score"].to_numpy(), "margin": props["margin"].to_numpy(),
                 "invoice_ids": [tuple(sorted(self._inv_ids[list(i)])) for i in props["invoices"]]}))
+        memory.mark("ML · décision, arbitrage, n↔n")
         actions = decide(props, self.thresholds) if len(props) else np.array([], dtype=object)
         props = props.assign(action=actions)
         props = props[props["action"] != ""]
@@ -404,8 +405,15 @@ def fit_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules: RulesC
 
     t = time.perf_counter()
     features = recorder.features
-    model = PairModel.fit(train, valid, features, settings.reconcile_ml.training,
-                          settings.reconcile_ml.second_pass, settings.reconcile_ml.calibration)
+    training = settings.reconcile_ml.training
+    log(f"… entraînement (scores OOF de la pass 2 : {training.oof_scheme})")
+    model = PairModel.fit(train, valid, features, training, settings.reconcile_ml.second_pass,
+                          settings.reconcile_ml.calibration, oof=training.oof_scheme,
+                          imputations=data.tables["imputation"], purge_days=settings.split.purge_days,
+                          retention_days=settings.split.retention_days)
+    oof_info = model.meta.get("oof", {})
+    if oof_info.get("repli"):
+        log(f"  ⚠ {oof_info['repli']}")
     timings["entraînement"] = round(time.perf_counter() - t, 1)
 
     raw_valid = model.raw(valid, valid[GROUP].to_numpy())
@@ -438,7 +446,7 @@ def fit_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules: RulesC
         "settings": settings.reconcile_ml.model_dump(), "periods": {
             "train": [str(train_p.start), str(train_p.end)], "validation": [str(valid_p.start), str(valid_p.end)]},
         "thresholds": thresholds, "metrics": metrics, "timings_s": timings,
-        "categories": recorder.featurizer.categories,
+        "categories": recorder.featurizer.categories, "oof": oof_info,
     }
     model.save(model_dir)
     calibration_table(valid["label"].to_numpy(), p_valid).to_csv(model_dir / "calibration_validation.csv", index=False)

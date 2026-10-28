@@ -266,6 +266,7 @@ class RulesMatcher:
                 raise ValueError(f"règle inconnue : {rule.id}")
             by_rule[rule.id] = found
             decided[found["row"].to_numpy()] = True
+        memory.mark("règles · mesure seule, cascade, arbitrage")
         self._record(by_rule, batch_ids, pos, ctx.day)
 
         # Cascade : la règle de plus haute priorité ayant une solution unique l'emporte.

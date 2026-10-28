@@ -176,3 +176,67 @@ def test_training_resumes_from_saved_dataset(trained):
     changed.reconcile_ml.training.payment_sample = 0.5 if settings.reconcile_ml.training.payment_sample != 0.5 else 0.9
     with pytest.raises(RuntimeError, match="ne correspond plus"):
         fit_ml(interim, root / "model_refused", changed, RulesConfig(), log=logs.append, reuse_dataset=True)
+
+
+# --- Scores OOF de la pass 2 : walk-forward (par défaut) et folds aléatoires (version précédente) ----------------
+
+def _wf_world():
+    """4 mois de paires : 1 positif + 3 négatifs par paiement, 40 paiements par mois."""
+    rows, imps = [], []
+    for m, month in enumerate(["2024-01", "2024-02", "2024-03", "2024-04"]):
+        for p in range(40):
+            pid, day = f"P{m}{p:02d}", pd.Timestamp(f"{month}-10")
+            for j in range(4):
+                rows.append({"payment_id": pid, "invoice_id": f"I{m}{p:02d}{j}", "day": day, "label": int(j == 0),
+                             "f": float(j == 0) + 0.01 * p})
+            # Mois 2 : imputations prononcées très tard (après le 1er avril) → issue inconnue au 1er mars.
+            when = pd.Timestamp("2024-04-15") if m == 1 else day + pd.Timedelta(days=2)
+            imps.append({"payment_id": pid, "invoice_id": f"I{m}{p:02d}0", "updated_at": when})
+    train = pd.DataFrame(rows)
+    train[GROUP] = train["payment_id"]
+    return train, pd.DataFrame(imps)
+
+
+def test_walk_forward_uses_only_the_past_and_known_labels():
+    from src.reconcile_ml.model import walk_forward_scores
+    from src.settings import TrainingSettings
+    train, imps = _wf_world()
+    cfg = TrainingSettings(num_boost_round=10, min_data_in_leaf=5, walk_forward_min_positives=5)
+    scores, log = walk_forward_scores(train, train[["f"]], 10, cfg, imps, purge_days=5, retention_days=60)
+    by_date = {e["date"]: e for e in log}
+    # Premier mois : pas de passé, pas de score.
+    assert np.isnan(scores[(train["day"] < "2024-02-01").to_numpy()]).all()
+    # Au 1er mars : janvier seul (160 paires) ; février (issue inconnue au 1er mars, < rétention) est écarté.
+    assert by_date["2024-03-01"]["paires_apprises"] == 160 and by_date["2024-03-01"]["positifs"] == 40
+    # Au 1er avril : février toujours inconnu (imputé le 15 avril) ; janvier et mars connus.
+    assert by_date["2024-04-01"]["paires_apprises"] == 320
+    assert not np.isnan(scores[(train["day"] >= "2024-02-01").to_numpy()]).any()
+
+
+def test_walk_forward_step_scores_following_months_with_one_model():
+    from src.reconcile_ml.model import walk_forward_scores
+    from src.settings import TrainingSettings
+    train, imps = _wf_world()
+    cfg = TrainingSettings(num_boost_round=10, min_data_in_leaf=5, walk_forward_min_positives=5,
+                           walk_forward_step_months=2)
+    scores, log = walk_forward_scores(train, train[["f"]], 10, cfg, imps, purge_days=5, retention_days=60)
+    assert [e["date"] for e in log] == ["2024-02-01", "2024-04-01"]
+    assert log[0]["paires_scorees"] == 320                # février et mars, par le modèle du 1er février
+
+
+def test_fit_keeps_random_folds_available():
+    from src.settings import TrainingSettings
+    train, imps = _wf_world()
+    valid = train[train["day"] >= "2024-04-01"]
+    cfg = TrainingSettings(num_boost_round=10, min_data_in_leaf=5, walk_forward_min_positives=5)
+    old = PairModel.fit(train, valid, ["f"], cfg, oof="random_folds")
+    new = PairModel.fit(train, valid, ["f"], cfg, oof="walk_forward", imputations=imps)
+    assert old.meta["oof"]["schema"] == "random_folds" and old.pass2 is not None
+    assert new.meta["oof"]["schema"] == "walk_forward" and new.meta["oof"]["paires_sans_score"] == 160
+    with pytest.raises(ValueError):
+        PairModel.fit(train, valid, ["f"], cfg, oof="walk_forward")          # dates des labels manquantes
+
+
+def test_fit_ml_records_the_oof_scheme(trained):
+    _, settings, _, meta = trained
+    assert meta["oof"]["schema"] == settings.reconcile_ml.training.oof_scheme == "walk_forward"

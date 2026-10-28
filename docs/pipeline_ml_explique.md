@@ -232,10 +232,17 @@ Cette information est **au niveau du paiement** ; un modèle pointwise ne peut p
 train : elle a vu les labels, ses scores sont trop nets (precision@1 en in-sample 0,991 contre 0,949 en validation sur
 le 40 k), et la pass 2 apprendrait des marges qu'elle ne reverra jamais.
 
-On découpe donc le train en **3 folds par paiement** (`model.py:119-125`) :
-- chaque paire est scorée par un modèle de fold qui n'a vu **aucun label de son paiement** (score OOF) ;
-- les modèles de fold utilisent le nombre d'itérations de la pass 1 et sont **jetés** ensuite ;
-- en validation, en test et en production, la compétition vient de la pass 1 complète, comme en production.
+Deux schémas, au choix (`reconcile_ml.training.oof_scheme`, `PairModel.fit`, `src/reconcile_ml/model.py`) :
+- **`walk_forward`, par défaut** (`walk_forward_scores`) : aux dates Dₖ (débuts de mois, tous les
+  `walk_forward_step_months`), un modèle est appris sur les paiements arrivés avant Dₖ − purge, avec les seuls labels
+  connus à Dₖ, et score les paiements de [Dₖ, Dₖ₊₁). Un paiement dont l'issue est encore inconnue à Dₖ est écarté, pas
+  compté négatif. Le premier mois, sans passé, est exclu de la pass 2. C'est exactement ce que verrait la production ;
+- **`random_folds`, l'ancien schéma** : 3 folds tirés par paiement ; chaque paire est scorée par un modèle de fold qui
+  n'a vu aucun label de son paiement, mais qui a vu le futur du train (F4).
+
+Dans les deux cas, les modèles intermédiaires utilisent le nombre d'itérations de la pass 1 et sont **jetés** ensuite ;
+en validation, en test et en production, la compétition vient de la pass 1 complète. Le bilan du walk-forward (mois,
+paires apprises, modèles entraînés) est enregistré dans `model.json`, clé `oof`.
 
 **Pourquoi par paiement.** L'unité du fold doit être l'unité d'agrégation des features de compétition. Sinon, le
 « meilleur concurrent » d'une paire pourrait être scoré par un modèle qui a vu son label.
@@ -244,10 +251,12 @@ On découpe donc le train en **3 folds par paiement** (`model.py:119-125`) :
 validation. Les scores OOF ressemblent à ceux de la validation, pas à ceux de l'in-sample : pas de stacking leakage.
 
 **Limites.**
-- Les folds ne sont **pas temporels** : un paiement de janvier est scoré par un modèle qui a vu février à août. C'est un
-  look-ahead leakage (F4), confiné au training de la pass 2. Mesuré : une pass 2 nourrie en walk-forward fait au moins
-  aussi bien, donc la correction ne coûte rien.
-- Leur nombre d'itérations vient de l'early stopping **sur la validation**.
+- Avec `random_folds`, les folds ne sont **pas temporels** : un paiement de janvier est scoré par un modèle qui a vu
+  février à août (look-ahead leakage F4). Mesuré : une pass 2 nourrie en walk-forward fait au moins aussi bien, d'où le
+  passage au walk-forward par défaut.
+- Le walk-forward entraîne plus de modèles. Sur un long historique, `walk_forward_step_months: 2` ou `3` divise le
+  nombre de modèles d'autant.
+- Le nombre d'itérations des modèles intermédiaires vient toujours de l'early stopping **sur la validation**.
 
 Les deux points sont détaillés dans `docs/fuites_ml.md` et le notebook de séance (§ 4).
 
@@ -567,7 +576,7 @@ complet et des seuils figés, puis compare chaque décision aux imputations rée
 | 3. Features | 54 features relatives, datées | mesurer la paire et le contexte du débiteur | aucune feature seule ne domine | attributs statiques non datés (F2) |
 | 4. Dataset | replay train + validation, labels à part | mêmes features qu'en production, pas de fuite de vérité | 24,9 M de paires | labels sans horizon (F3), jour d'arrivée seulement |
 | 5. Pass 1 | LightGBM binaire par paire | tabulaire, non linéaire, score absolu | precision@1 95,7 % | ignore la concurrence |
-| 6. Folds OOF | compétition sans label du paiement | stacking sans fuite | OOF ≈ validation | folds non temporels (F4) |
+| 6. Scores OOF | compétition sans label du paiement, en walk-forward | stacking sans fuite, sans futur | OOF ≈ validation | itérations venues de la validation |
 | 7. Pass 2 | score avec le contexte du paiement | la confiance dépend des concurrents | log-loss −8 % (40 k) | apport à chiffrer en automatisation |
 | 8. Isotonique | score → probabilité lisible | lecture, suivi | hors échantillon : pas de gain | ne sert pas à décider |
 | 9. Propositions | single / partial / set, marge | on impute des ensembles | `set` à 98,9 % sur le test | score d'ensemble = moyenne |

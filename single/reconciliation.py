@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import functools
 import gc
 import hashlib
 import html
@@ -34,12 +35,14 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import textwrap
 import threading
 import time
 import yaml
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Executor, ProcessPoolExecutor
 from contextlib import contextmanager
@@ -55,7 +58,7 @@ from scipy.sparse.csgraph import connected_components
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 from types import SimpleNamespace
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -329,6 +332,17 @@ class TrainingSettings(_Model):
     num_leaves: int = Field(63, ge=2, description="Feuilles par arbre.")
     min_data_in_leaf: int = Field(50, ge=1, description="Observations minimales par feuille.")
     seed: int = Field(42, description="Graine (reproductibilité).")
+    oof_scheme: Literal["walk_forward", "random_folds"] = Field(
+        "walk_forward", description="Scores de pass 1 du train qui nourrissent les features de compétition de la "
+        "pass 2. walk_forward : chaque mois est scoré par un modèle appris sur le seul passé, avec les labels "
+        "connus à cette date, comme en production. random_folds : version précédente, 3 folds tirés par "
+        "paiement (un modèle de fold voit le futur du train : fuite F4, docs/fuites_ml.md).")
+    walk_forward_step_months: int = Field(1, ge=1, description="Walk-forward : un modèle tous les N mois, qui "
+                                          "score les N mois suivants. N plus grand = apprentissage plus rapide.")
+    walk_forward_window_months: int | None = Field(None, ge=1, description="Walk-forward : fenêtre "
+                                                   "d'apprentissage glissante, en mois. Vide = tout le passé disponible.")
+    walk_forward_min_positives: int = Field(50, ge=1, description="Walk-forward : paires positives minimales "
+                                            "pour entraîner un modèle. Les mois sans modèle sont exclus de la pass 2.")
 
 
 class DecisionSettings(_Model):
@@ -585,16 +599,20 @@ def lists_intersect(a, a_pos: np.ndarray, b, b_pos: np.ndarray) -> np.ndarray:
         lb = list_take(b, b_pos) if isinstance(b, pd.Series) else [v or [] for v in b.take(pa.array(b_pos)).to_pylist()]
         return np.fromiter((bool(set(x) & set(y)) for x, y in zip(la, lb)), dtype=bool, count=n)
 
-    def flat(arr: pa.Array, pos: np.ndarray) -> pd.DataFrame:
+    def flat(arr: pa.Array, pos: np.ndarray) -> tuple[np.ndarray, pa.Array]:
         taken = arr.take(pa.array(np.asarray(pos, dtype=np.int64)))
-        return pd.DataFrame({"line": pc.list_parent_indices(taken).to_numpy(zero_copy_only=False),
-                             "value": pc.list_flatten(taken).to_numpy(zero_copy_only=False)})
+        values = pc.fill_null(pc.list_flatten(taken).cast(pa.large_string()), "\x00")     # null = null, comme un set
+        return pc.list_parent_indices(taken).to_numpy(zero_copy_only=False).astype(np.int64), values
 
-    left, right = flat(a, a_pos), flat(b, b_pos)
+    (la, va), (lb, vb) = flat(a, a_pos), flat(b, b_pos)
     out = np.zeros(n, dtype=bool)
-    if len(left) and len(right):
-        common = left.merge(right.drop_duplicates(), on=["line", "value"])
-        out[common["line"].to_numpy(dtype=np.int64)] = True
+    if len(la) and len(lb):
+        # Valeurs codées en entiers (égalité exacte) ; une ligne est citée si un couple (ligne, code) est commun.
+        codes = pc.dictionary_encode(pa.concat_arrays([va, vb])).indices.to_numpy(zero_copy_only=False)
+        codes = codes.astype(np.int64)
+        width = int(codes.max()) + 1
+        left, right = la * width + codes[:len(la)], lb * width + codes[len(la):]
+        out[la[np.isin(left, right)]] = True
     return out
 
 
@@ -620,6 +638,9 @@ Un fil d'arrière-plan relève chaque seconde :
 Chaque relevé est **écrit et vidé immédiatement** dans un CSV : si le noyau est tué (OOM), le fichier
 reste, et `by_phase(path)` / `chart(path)` montrent, dans un nouveau noyau, la phase où la mémoire a
 explosé. `tail -f` sur ce fichier depuis un terminal JupyterLab donne un suivi en direct.
+
+Les mêmes relevés donnent un **profil de temps** sans coût supplémentaire : `time_profile(path)` compte, par
+étape et sous-étape, le temps écoulé entre deux relevés (précision : l'intervalle, 1 s par défaut).
 
 `mark*` ne coûtent rien sans moniteur actif. Aucun appel réseau.
 """
@@ -731,6 +752,9 @@ def release_memory() -> None:
 
 
 # --- Phases (appelées depuis la pipeline) ----------------------------------------------------------------
+
+IDLE = "(inactif)"            # étape posée à la sortie des méthodes de `Project` : exclue du profil de temps
+
 
 def mark(sub: str) -> None:
     """Sous-étape en cours (signal d'allocation, règle, candidats ML...)."""
@@ -937,10 +961,63 @@ def chart(path: str | Path = "reports/memory.csv", session: int = -1):
     return alt.layer(*layers).properties(height=260, title="Mémoire (limite du pod en rouge)")
 
 
+# --- Profil de temps ------------------------------------------------------------------------------------------
+
+_NO_SUB = "(préparation, chargement, début de jour)"
+
+
+_VARIABLE = [(re.compile(r"\d{4}-\d{2}-\d{2}"), "date"), (re.compile(r"\(\d+/\d+\)"), "(n/n)"),
+             (re.compile(r"bloc \d+/\d+"), "bloc n/n"), (re.compile(r"\d[\d\s]* paires"), "n paires")]
+
+
+def _generic(label: str) -> str:
+    """Étiquette sans ses parties variables (bloc 2/5, 123 paires, date, 3/9) : les relevés d'une même phase se
+    cumulent. Les identifiants (R4, passe 1) sont gardés."""
+    for pattern, repl in _VARIABLE:
+        label = pattern.sub(repl, label)
+    return label.strip()
+
+
+def time_profile(path: str | Path = "reports/memory.csv", session: int | None = None) -> pd.DataFrame:
+    """Temps passé par (étape, sous-étape), lu sur les relevés du moniteur (toutes sessions par défaut).
+
+    Chaque relevé compte pour l'intervalle qui le sépare du suivant : coût nul (le moniteur tourne déjà),
+    précision de l'ordre de l'intervalle de relevé. Le temps d'inactivité entre deux méthodes de `Project`
+    (étape `IDLE`) est exclu."""
+    df = _session(read_history(path), session)
+    cols = ["étape", "sous-étape", "minutes", "part de l'étape", "part du total"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    nxt = df.groupby("session")["elapsed_s"].shift(-1)
+    df = df.assign(dt=(nxt - df["elapsed_s"]).clip(lower=0).fillna(0),
+                   sub=df["sub"].map(_generic).replace("", _NO_SUB), step=df["step"].map(_generic).replace("", IDLE))
+    df = df[df["step"] != IDLE]
+    out = df.groupby(["step", "sub"], sort=False)["dt"].sum().reset_index()
+    out["minutes"] = out["dt"] / 60
+    out["part de l'étape"] = out["minutes"] / out.groupby("step")["minutes"].transform("sum")
+    out["part du total"] = out["minutes"] / out["minutes"].sum()
+    order = {s: i for i, s in enumerate(out["step"].unique())}
+    out = out.assign(_o=out["step"].map(order)).sort_values(["_o", "minutes"], ascending=[True, False])
+    return out.rename(columns={"step": "étape", "sub": "sous-étape"})[cols].reset_index(drop=True)
+
+
+def time_chart(path: str | Path = "reports/memory.csv", session: int | None = None, top: int = 25):
+    """Barres du temps par sous-étape (altair), les `top` plus longues, colorées par étape."""
+    import altair as alt
+    prof = time_profile(path, session).nlargest(top, "minutes")
+    prof["phase"] = prof["étape"] + " › " + prof["sous-étape"]
+    return alt.Chart(prof).mark_bar().encode(
+        x=alt.X("minutes:Q"), y=alt.Y("phase:N", sort="-x", title=None), color=alt.Color("étape:N", legend=None),
+        tooltip=["étape", "sous-étape", alt.Tooltip("minutes:Q", format=".1f"),
+                 alt.Tooltip("part du total:Q", format=".0%")]).properties(height=22 * len(prof),
+                                                                            title="Temps par sous-étape")
+
+
 # Espace de noms « memory » (src/memory.py dans le dépôt).
 memory = SimpleNamespace(**{n: globals()[n] for n in (
     'MemoryMonitor', 'by_phase', 'chart', 'end_day', 'mark', 'mark_day', 'mark_step',
-    'pod_memory', 'process_rss', 'read_history', 'release_memory', 'available_cpus')})
+    'pod_memory', 'process_rss', 'read_history', 'release_memory', 'available_cpus',
+    'time_profile', 'time_chart', 'IDLE')})
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1138,6 +1215,229 @@ def lightgbm_callback(t: Task):
 # Espace de noms « progress » (src/progress.py dans le dépôt).
 progress = SimpleNamespace(**{n: globals()[n] for n in (
     'Task', 'task', 'use_notebook', 'use_log', 'disable', 'active', 'chosen', 'lightgbm_callback')})
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# src/profiling.py
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+"""Profil par fonction, par échantillonnage : d'où vient le temps d'un run, sans le ralentir.
+
+    from src import profiling
+    prof = profiling.Profiler("reports/profiles", enabled=True)
+    with prof("règles · test"):
+        project.backtest("test", matcher="rules")
+    prof.summary("règles · test")          # temps par fonction du projet (bibliothèques comprises)
+
+Pourquoi l'échantillonnage : un profileur déterministe (cProfile) instrumente chaque appel et ralentit un code
+Python d'un facteur 1,5 à 3, ce qui fausse aussi la répartition. Un échantillonneur relève la pile d'appels à
+intervalle régulier ; le temps d'une fonction est estimé par la part des relevés où elle figure.
+
+Deux moteurs, même sortie : des piles « repliées » (`f1;f2;f3 n`), lisibles par speedscope.app ou flamegraph.pl.
+- **py-spy** (`pip install py-spy`), choisi s'il est disponible : il lit la mémoire du processus depuis
+  l'extérieur, sans le suspendre (`--nonblocking`) ; impact négligeable. Dans un conteneur, il faut la capacité
+  `SYS_PTRACE` (celle qu'utilise `py-spy dump`).
+- **fil interne** (repli, rien à installer) : un fil Python relève la pile du fil principal `rate` fois par seconde
+  (10 par défaut), soit environ 0,1 ms de travail par relevé ; impact inférieur à 1 %.
+
+Une fonction est rangée par sa ligne de définition, pas par la ligne en cours : ses relevés se cumulent.
+"""
+
+
+
+
+_FRAME = re.compile(r"^(?P<func>.*) \((?P<file>.*):(?P<line>\d+)\)$")
+_FRAME_NO_LINE = re.compile(r"^(?P<func>.*) \((?P<file>[^()]*)\)$")       # py-spy --function, selon la version
+
+
+def _match(frame: str):
+    return _FRAME.match(frame) or _FRAME_NO_LINE.match(frame)
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^\w.-]+", "_", name, flags=re.UNICODE).strip("_") or "profil"
+
+
+class _ThreadSampler:
+    """Relève la pile du fil `thread_id`, `rate` fois par seconde, dans un fil démon."""
+
+    def __init__(self, rate: float, thread_id: int):
+        self.interval, self.thread_id = 1.0 / rate, thread_id
+        self.counts: Counter[str] = Counter()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="profil", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            frame = sys._current_frames().get(self.thread_id)
+            stack = []
+            while frame is not None:
+                code = frame.f_code
+                stack.append(f"{code.co_name} ({code.co_filename}:{code.co_firstlineno})")
+                frame = frame.f_back
+            if stack:
+                self.counts[";".join(reversed(stack))] += 1
+
+    def stop(self, output: Path) -> None:
+        self._stop.set()
+        self._thread.join()
+        output.write_text("".join(f"{stack} {n}\n" for stack, n in self.counts.items()), encoding="utf-8")
+
+
+class _PySpy:
+    """`py-spy record` sur le processus courant, au format replié, arrêté par un signal d'interruption."""
+
+    def __init__(self, executable: str, rate: float, output: Path, subprocesses: bool):
+        cmd = [executable, "record", "--pid", str(os.getpid()), "--rate", str(int(rate)), "--format", "raw",
+               "--function", "--nonblocking", "--output", str(output)]
+        if subprocesses:
+            cmd.append("--subprocesses")
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                     creationflags=flags)
+        time.sleep(0.5)
+        if self.proc.poll() is not None:                       # échec d'attachement (droits ptrace…)
+            raise RuntimeError((self.proc.stderr.read() or "py-spy s'est arrêté").strip())
+
+    def stop(self, output: Path) -> None:
+        self.proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+        try:
+            self.proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def find_pyspy() -> str | None:
+    """Exécutable py-spy : PATH, puis dossiers de scripts de cet interpréteur (pip install --user compris)."""
+    import sysconfig
+    found = shutil.which("py-spy")
+    if found:
+        return found
+    names = ("py-spy.exe", "py-spy") if os.name == "nt" else ("py-spy",)
+    folders = {Path(sys.executable).parent, Path(sysconfig.get_path("scripts"))}
+    scheme = "nt_user" if os.name == "nt" else "posix_user"
+    try:
+        folders.add(Path(sysconfig.get_path("scripts", scheme)))
+    except KeyError:
+        pass
+    for folder in folders:
+        for name in names:
+            if (folder / name).exists():
+                return str(folder / name)
+    return None
+
+
+class Profiler:
+    """Profils nommés, un fichier de piles repliées par mesure ; `enabled=False` : aucun effet, aucun coût."""
+
+    def __init__(self, folder: str | Path = "reports/profiles", enabled: bool = True, rate: float = 10,
+                 engine: str = "auto", subprocesses: bool = False, log=print):
+        self.folder, self.enabled, self.rate = Path(folder), enabled, rate
+        self.engine, self.subprocesses, self.log = engine, subprocesses, log
+        self.runs: dict[str, dict] = {}
+
+    def _start(self, output: Path):
+        exe = find_pyspy() if self.engine in ("auto", "py-spy") else None
+        if exe:
+            try:
+                return "py-spy", _PySpy(exe, self.rate, output, self.subprocesses)
+            except RuntimeError as exc:
+                if self.engine == "py-spy":
+                    raise
+                self.log(f"  profil : py-spy indisponible ({exc}) ; repli sur le fil interne")
+        sampler = _ThreadSampler(self.rate, threading.main_thread().ident)
+        sampler.start()
+        return "fil interne", sampler
+
+    @contextmanager
+    def __call__(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        self.folder.mkdir(parents=True, exist_ok=True)
+        output = self.folder / f"{_slug(name)}.txt"
+        engine, sampler = self._start(output)
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            sampler.stop(output)
+            self.runs[name] = {"fichier": output, "secondes": time.perf_counter() - start, "moteur": engine,
+                               "rate": self.rate}
+            self.log(f"  profil « {name} » : {self.runs[name]['secondes']:.0f} s, {engine} → {output}")
+
+    def summary(self, name: str | None = None, top: int = 25) -> pd.DataFrame:
+        """Tableau du profil `name` (le dernier si absent) : voir `stack_summary`."""
+        if not self.runs:
+            raise ValueError("aucun profil : activer le profileur (enabled=True) puis relancer l'étape")
+        run = self.runs[name] if name else list(self.runs.values())[-1]
+        # Le fil interne peut relever moins souvent que prévu (GIL, horloge) : ses durées sont calées sur le temps
+        # écoulé. py-spy respecte sa fréquence et n'enregistre pas l'inactivité : ses relevés valent 1 / rate.
+        seconds = run["secondes"] if run["moteur"] == "fil interne" else None
+        return stack_summary(run["fichier"], rate=run["rate"], top=top, seconds=seconds)
+
+
+def _parse(path: Path) -> list[tuple[list[str], int]]:
+    stacks = []
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        stack, _, count = line.rpartition(" ")
+        if stack and count.isdigit():
+            stacks.append((stack.split(";"), int(count)))
+    return stacks
+
+
+def _is_project(frame: str) -> bool:
+    m = _match(frame)
+    file = (m["file"] if m else frame).replace("\\", "/")
+    return "/src/" in f"/{file}" and "site-packages" not in file or file.endswith("reconciliation.py")
+
+
+def _label(frame: str) -> tuple[str, str]:
+    m = _match(frame)
+    if not m:
+        return frame, ""
+    file = m["file"].replace("\\", "/")
+    short = file.split("/src/")[-1] if "/src/" in file else file.split("/")[-1]
+    line = m.groupdict().get("line")
+    return m["func"], f"{short}:{line}" if line else short
+
+
+def stack_summary(path: str | Path, rate: float = 10, top: int = 25, seconds: float | None = None) -> pd.DataFrame:
+    """Temps par fonction du projet, depuis un fichier de piles repliées.
+
+    - `inclus` : temps où la fonction est dans la pile (elle et tout ce qu'elle appelle) ;
+    - `propre` : temps où c'est la fonction du projet la plus profonde de la pile, bibliothèques comprises
+      (pandas, numpy, LightGBM…) : c'est là qu'il faut optimiser.
+    Les relevés hors code du projet (attente, import) sont comptés dans la ligne « hors projet ».
+    `seconds` : durée réelle de la mesure ; si elle est donnée, les relevés sont répartis sur cette durée au lieu
+    de valoir chacun 1 / `rate`."""
+    stacks = _parse(Path(path))
+    total = sum(n for _, n in stacks) or 1
+    if seconds is not None:
+        rate = total / seconds if seconds > 0 else rate
+    inclusive: Counter[str] = Counter()
+    own: Counter[str] = Counter()
+    for frames, n in stacks:
+        project = [f for f in frames if _is_project(f)]
+        for f in set(project):
+            inclusive[f] += n
+        own[project[-1] if project else "hors projet"] += n
+    rows = []
+    for frame in set(inclusive) | set(own):
+        func, where = _label(frame) if frame != "hors projet" else ("hors projet", "")
+        rows.append({"fonction": func, "où": where, "propre (s)": own[frame] / rate,
+                     "inclus (s)": inclusive[frame] / rate, "part propre": own[frame] / total})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values("propre (s)", ascending=False).head(top).reset_index(drop=True)
+
+
+profiling = SimpleNamespace(**{n: globals()[n] for n in (
+    'Profiler', 'stack_summary', 'find_pyspy')})
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -3092,11 +3392,13 @@ class DailyIterator:
         state = self.state
         # Reliquat initial : paiements arrivés dans la fenêtre de rétention avant `start`.
         warm = self.start - pd.Timedelta(days=self.retention_days)
+        memory.mark("état · reconstruction jusqu'au début du replay")
         state.advance_to(warm)
         self._pending, self._first_day = state.payments_arriving(warm, self.start)
 
         day = self.start
         while day <= self.end:
+            memory.mark("état · avance d'un jour, lot du jour")
             state.advance_to(day)
             today = _to_us(day) // DAY_US
             new, _ = state.payments_arriving(day, day + pd.Timedelta(days=1))
@@ -3162,8 +3464,9 @@ def run_replay(state: LedgerState, matcher: Matcher, start: date, end: date, ret
 
     `label` : nom de la tâche dans le suivi de progression (`src/progress.py`).
     """
-    with progress.task(label or f"rejeu {getattr(matcher, 'name', 'rapprocheur')}",
-                       (pd.Timestamp(end) - pd.Timestamp(start)).days + 1, "jours") as task:
+    name = label or f"rejeu {getattr(matcher, 'name', 'rapprocheur')}"
+    memory.mark_step(name)                             # étape du suivi mémoire et du profil de temps
+    with progress.task(name, (pd.Timestamp(end) - pd.Timestamp(start)).days + 1, "jours") as task:
         return _run_replay(state, matcher, start, end, retention_days, on_day, task)
 
 
@@ -3174,7 +3477,9 @@ def _run_replay(state, matcher, start, end, retention_days, on_day, task) -> Rep
     for ctx in it:
         t = time.perf_counter()
         memory.mark_day(ctx.day, len(ctx.batch))
-        dec = _validate(matcher.process(ctx), ctx)
+        dec = matcher.process(ctx)
+        memory.mark("boucle · contrôle anti-fuite, bilan du jour")
+        dec = _validate(dec, ctx)
         it.resolve(dec.loc[dec["action"] == AUTO, "payment_id"].unique())
         if len(dec):
             frames.append(dec.assign(day=ctx.day))
@@ -4929,6 +5234,7 @@ class RulesMatcher:
                 raise ValueError(f"règle inconnue : {rule.id}")
             by_rule[rule.id] = found
             decided[found["row"].to_numpy()] = True
+        memory.mark("règles · mesure seule, cascade, arbitrage")
         self._record(by_rule, batch_ids, pos, ctx.day)
 
         # Cascade : la règle de plus haute priorité ayant une solution unique l'emporte.
@@ -5446,8 +5752,11 @@ class Featurizer:
 - Passe 1 : features des familles actives.
 - Features de compétition dérivées des scores de passe 1 au sein d'un même paiement : rang,
   marge au meilleur autre candidat, meilleur score concurrent. En entraînement, les scores de
-  passe 1 sont obtenus hors échantillon (validation croisée par paiement) pour ne pas biaiser
-  la passe 2.
+  passe 1 sont obtenus hors échantillon pour ne pas biaiser la passe 2 :
+  - `walk_forward` (par défaut dans les réglages) : chaque mois est scoré par un modèle appris sur
+    le seul passé, avec les labels connus à cette date, comme la production le verrait ;
+  - `random_folds` (version précédente) : 3 folds tirés par paiement ; un modèle de fold voit le
+    futur du train (fuite F4, docs/fuites_ml.md).
 - Passe 2 : features actives + compétition.
 - Calibration isotonique des scores de passe 2 sur la période de validation.
 
@@ -5499,12 +5808,68 @@ def _train(X: pd.DataFrame, y: np.ndarray, Xv: pd.DataFrame | None, yv: np.ndarr
     cats = [c for c in CATEGORICAL if c in X.columns]
     train = lgb.Dataset(X, label=y, categorical_feature=cats, free_raw_data=True)
     valid = [lgb.Dataset(Xv, label=yv, categorical_feature=cats, reference=train)] if Xv is not None else []
+    memory.mark(label)
     with progress.task(f"{label} ({len(X)} paires)", cfg.num_boost_round, "itérations") as task:
         callbacks = [progress.lightgbm_callback(task)]
         if valid:
             callbacks.append(lgb.early_stopping(30, verbose=False))
         return lgb.train(_params(cfg), train, num_boost_round=cfg.num_boost_round, valid_sets=valid,
                          callbacks=callbacks)
+
+
+OOF_SCHEMES = ("walk_forward", "random_folds")
+
+
+def _labels_known(pairs: pd.DataFrame, imputations: pd.DataFrame) -> np.ndarray:
+    """Label de chaque paire (paiement, facture) d'après les seules imputations données."""
+    truth = imputations[["payment_id", "invoice_id"]].drop_duplicates().assign(_hit=1)
+    merged = pairs[["payment_id", "invoice_id"]].merge(truth, on=["payment_id", "invoice_id"], how="left")
+    return merged["_hit"].fillna(0).to_numpy(dtype=np.int8)
+
+
+def walk_forward_scores(train: pd.DataFrame, X: pd.DataFrame, rounds: int, cfg: TrainingSettings,
+                        imputations: pd.DataFrame, purge_days: int, retention_days: int) -> tuple[np.ndarray, list[dict]]:
+    """Scores de pass 1 du train, « comme en production ».
+
+    Aux dates Dₖ (débuts de mois, tous les `walk_forward_step_months`), un modèle est appris sur les paiements
+    arrivés avant Dₖ − purge (dans la fenêtre `walk_forward_window_months` si elle est fixée), avec les seuls
+    labels connus à Dₖ : imputations d'horodatage antérieur à Dₖ. Un paiement sans imputation connue à Dₖ et plus
+    récent que la rétention a une issue inconnue : il est écarté, pas compté négatif. Le modèle score les paires
+    des paiements arrivés dans [Dₖ, Dₖ₊₁). NaN : paire sans modèle (premier mois, trop peu de positifs).
+    """
+    day = pd.to_datetime(train["day"]).reset_index(drop=True)
+    month = day.dt.to_period("M").dt.start_time
+    starts = sorted(month.unique())
+    cutoffs = [pd.Timestamp(m) for m in starts[1::cfg.walk_forward_step_months]]
+    imp = imputations[["payment_id", "invoice_id", "updated_at"]].dropna()
+    imp_ts = pd.to_datetime(imp["updated_at"]).to_numpy()
+    purge, retention = pd.Timedelta(days=purge_days), pd.Timedelta(days=retention_days)
+    pairs = train[["payment_id", "invoice_id"]].reset_index(drop=True)
+    fixed = cfg.model_copy(update={"num_boost_round": rounds})
+    scores, log = np.full(len(train), np.nan), []
+    for k, d_k in enumerate(cutoffs):
+        end = cutoffs[k + 1] if k + 1 < len(cutoffs) else None
+        target = ((day >= d_k) & (day < end) if end is not None else (day >= d_k)).to_numpy()
+        seen = day < d_k - purge
+        if cfg.walk_forward_window_months:
+            seen &= day >= d_k - pd.DateOffset(months=cfg.walk_forward_window_months)
+        seen = seen.to_numpy()
+        known = imp[imp_ts < d_k.to_datetime64()]
+        labels = _labels_known(pairs[seen], known)
+        outcome = (pairs.loc[seen, "payment_id"].isin(known["payment_id"]).to_numpy()
+                   | (day[seen] < d_k - retention).to_numpy())
+        rows = np.flatnonzero(seen)[outcome]
+        n_pos = int(labels[outcome].sum())
+        entry = {"date": str(d_k.date()), "paires_apprises": int(len(rows)), "positifs": n_pos,
+                 "paires_scorees": int(target.sum())}
+        if n_pos < cfg.walk_forward_min_positives or not target.any():
+            log.append({**entry, "modele": False})
+            continue
+        model = _train(X.iloc[rows], labels[outcome], None, None, fixed,
+                       f"LightGBM passe 1, walk-forward {d_k.date()} ({k + 1}/{len(cutoffs)})")
+        scores[target] = model.predict(X[target], num_threads=threads(cfg.num_threads))
+        log.append({**entry, "modele": True})
+    return scores, log
 
 
 @dataclass
@@ -5537,25 +5902,44 @@ class PairModel:
 
     @classmethod
     def fit(cls, train: pd.DataFrame, valid: pd.DataFrame, features: list[str], cfg: TrainingSettings,
-            second_pass: bool = True, calibration: bool = True, folds: int = 3) -> PairModel:
+            second_pass: bool = True, calibration: bool = True, folds: int = 3, oof: str = "random_folds",
+            imputations: pd.DataFrame | None = None, purge_days: int = 5, retention_days: int = 60) -> PairModel:
+        """`oof` : schéma des scores de passe 1 du train pour la pass 2 (`OOF_SCHEMES`). `walk_forward` exige
+        `imputations` (payment_id, invoice_id, updated_at) et la colonne `day` du jeu."""
+        if oof not in OOF_SCHEMES:
+            raise ValueError(f"schéma OOF inconnu : {oof} ({', '.join(OOF_SCHEMES)})")
+        train = train.reset_index(drop=True)
         y, yv = train["label"].to_numpy(), valid["label"].to_numpy()
         X, Xv = train[features], valid[features]
         pass1 = _train(X, y, Xv, yv, cfg, "LightGBM passe 1")
-        pass2 = None
+        pass2, info = None, {"schema": oof}
         if second_pass:
-            # Scores de passe 1 hors échantillon sur l'entraînement (plis par paiement).
-            fold = (pd.util.hash_array(train[GROUP].astype(str).to_numpy()) % folds).astype(int)
-            oof = np.zeros(len(train))
-            fixed = cfg.model_copy(update={"num_boost_round": max(pass1.best_iteration, 10)})
-            for k in range(folds):
-                m = _train(X[fold != k], y[fold != k], None, None, fixed,
-                           f"LightGBM passe 1, pli {k + 1}/{folds} (scores hors échantillon)")
-                oof[fold == k] = m.predict(X[fold == k], num_threads=threads(cfg.num_threads))
-            X2 = pd.concat([X.reset_index(drop=True), competition_features(oof, train[GROUP].to_numpy())], axis=1)
+            rounds = max(pass1.best_iteration, 10)
+            used = np.ones(len(train), dtype=bool)
+            if oof == "walk_forward":
+                if imputations is None:
+                    raise ValueError("walk_forward : les imputations (dates des labels) sont nécessaires")
+                scores, log = walk_forward_scores(train, X, rounds, cfg, imputations, purge_days, retention_days)
+                used = ~np.isnan(scores)
+                info.update(mois=log, paires_pass2=int(used.sum()), paires_sans_score=int((~used).sum()))
+            if oof == "random_folds" or not used.any():
+                if oof == "walk_forward":            # aucun mois scoré (historique trop court) : repli signalé
+                    info["repli"] = "random_folds : aucun mois n'a assez d'historique pour un modèle walk-forward"
+                    used[:] = True
+                # Scores de passe 1 hors échantillon sur l'entraînement (plis par paiement).
+                fold = (pd.util.hash_array(train[GROUP].astype(str).to_numpy()) % folds).astype(int)
+                scores = np.zeros(len(train))
+                fixed = cfg.model_copy(update={"num_boost_round": rounds})
+                for k in range(folds):
+                    m = _train(X[fold != k], y[fold != k], None, None, fixed,
+                               f"LightGBM passe 1, pli {k + 1}/{folds} (scores hors échantillon)")
+                    scores[fold == k] = m.predict(X[fold == k], num_threads=threads(cfg.num_threads))
+            X2 = pd.concat([X[used].reset_index(drop=True),
+                            competition_features(scores[used], train.loc[used, GROUP].to_numpy())], axis=1)
             s1v = pass1.predict(Xv, num_threads=threads(cfg.num_threads))
             Xv2 = pd.concat([Xv.reset_index(drop=True), competition_features(s1v, valid[GROUP].to_numpy())], axis=1)
-            pass2 = _train(X2, y, Xv2, yv, cfg, "LightGBM passe 2")
-        model = cls(features, pass1, pass2, None)
+            pass2 = _train(X2, y[used], Xv2, yv, cfg, "LightGBM passe 2")
+        model = cls(features, pass1, pass2, None, {"oof": info})
         if calibration:
             raw_v = model.raw(valid, valid[GROUP].to_numpy())
             model.calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit(raw_v, yv)
@@ -5949,6 +6333,7 @@ class PipelineMatcher(_ResidualMixin):
                 "day": ctx.day, "payment_id": batch_ids[props["row"].to_numpy()], "kind": props["kind"].to_numpy(),
                 "score": props["score"].to_numpy(), "margin": props["margin"].to_numpy(),
                 "invoice_ids": [tuple(sorted(self._inv_ids[list(i)])) for i in props["invoices"]]}))
+        memory.mark("ML · décision, arbitrage, n↔n")
         actions = decide(props, self.thresholds) if len(props) else np.array([], dtype=object)
         props = props.assign(action=actions)
         props = props[props["action"] != ""]
@@ -6191,8 +6576,15 @@ def fit_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules: RulesC
 
     t = time.perf_counter()
     features = recorder.features
-    model = PairModel.fit(train, valid, features, settings.reconcile_ml.training,
-                          settings.reconcile_ml.second_pass, settings.reconcile_ml.calibration)
+    training = settings.reconcile_ml.training
+    log(f"… entraînement (scores OOF de la pass 2 : {training.oof_scheme})")
+    model = PairModel.fit(train, valid, features, training, settings.reconcile_ml.second_pass,
+                          settings.reconcile_ml.calibration, oof=training.oof_scheme,
+                          imputations=data.tables["imputation"], purge_days=settings.split.purge_days,
+                          retention_days=settings.split.retention_days)
+    oof_info = model.meta.get("oof", {})
+    if oof_info.get("repli"):
+        log(f"  ⚠ {oof_info['repli']}")
     timings["entraînement"] = round(time.perf_counter() - t, 1)
 
     raw_valid = model.raw(valid, valid[GROUP].to_numpy())
@@ -6225,7 +6617,7 @@ def fit_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules: RulesC
         "settings": settings.reconcile_ml.model_dump(), "periods": {
             "train": [str(train_p.start), str(train_p.end)], "validation": [str(valid_p.start), str(valid_p.end)]},
         "thresholds": thresholds, "metrics": metrics, "timings_s": timings,
-        "categories": recorder.featurizer.categories,
+        "categories": recorder.featurizer.categories, "oof": oof_info,
     }
     model.save(model_dir)
     calibration_table(valid["label"].to_numpy(), p_valid).to_csv(model_dir / "calibration_validation.csv", index=False)
@@ -6316,6 +6708,24 @@ def _stderr(message: str) -> None:
         print(message.encode("ascii", "replace").decode(), file=sys.stderr, flush=True)
 
 
+def _tracked(method):
+    """Méthode longue de `Project` : son nom sert d'étape au suivi mémoire tant qu'aucun message « … » ne la précise,
+    et l'étape redevient `memory.IDLE` à la sortie de l'appel le plus externe (le profil de temps exclut l'inactivité
+    du notebook entre deux cellules)."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._depth = getattr(self, "_depth", 0) + 1
+        if self._depth == 1:
+            memory.mark_step(method.__name__)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._depth -= 1
+            if self._depth == 0:
+                memory.mark_step(memory.IDLE)
+    return wrapper
+
+
 def _clean(value: Any) -> Any:
     return None if isinstance(value, float) and math.isnan(value) else value
 
@@ -6380,6 +6790,7 @@ class Project:
     # --- Étape 1 : chargement ---------------------------------------------------------------------------------
 
 
+    @_tracked
     def load(self) -> dict:
         """Charge les sources, normalise, construit le journal et le profil."""
 
@@ -6446,6 +6857,7 @@ class Project:
             return PipelineMatcher(state, settings, self.rules, PairModel.load(self.model_dir))
         raise ValueError(f"rapprocheur inconnu : {name} ({', '.join(MATCHERS)})")
 
+    @_tracked
     def replay(self, period: str = "test", matcher: str = "null") -> dict:
         """Rejoue la période jour par jour avec un rapprocheur ; écrit décisions et statistiques quotidiennes."""
         settings, timings = self.settings, {}
@@ -6480,6 +6892,7 @@ class Project:
 
     # --- Étape 3 : allocation --------------------------------------------------------------------------------------
 
+    @_tracked
     def measure_allocation(self, period: str = "validation") -> dict:
         """Rejoue l'allocation sur la période et mesure le rappel (cible du brief : 99 %)."""
         settings, timings = self.settings, {}
@@ -6509,6 +6922,7 @@ class Project:
 
     # --- Étape 5 : apprentissage ----------------------------------------------------------------------------------
 
+    @_tracked
     def train(self, reuse_dataset: bool = False) -> dict:
         """Rejoue entraînement + validation, entraîne le modèle, calibre les seuils, sauvegarde.
 
@@ -6518,6 +6932,7 @@ class Project:
         return fit_ml(self.interim_dir, self.model_dir, self.settings, self.rules, log=self.log,
                       reuse_dataset=reuse_dataset)
 
+    @_tracked
     def calibrate(self) -> dict:
         """Recalcule les seuils de décision du modèle existant sur la validation, sans réentraîner."""
         return recalibrate_ml(self.interim_dir, self.model_dir, self.settings, self.rules, log=self.log)
@@ -6544,6 +6959,7 @@ class Project:
         decisions = pd.read_parquet(self.interim_dir / "replay" / f"{tag}_decisions.parquet")
         return context, decisions, ground_truth(imputation), scope
 
+    @_tracked
     def export_decisions(self, period: str = "test", matcher: str = "pipeline", fmt: str = "parquet") -> Path:
         """Imputations proposées par un rejeu, une ligne par couple (paiement, facture), plus les couples
         réellement imputés non proposés : à joindre à la table d'imputation d'origine sur
@@ -6562,6 +6978,7 @@ class Project:
         self.log(f"  {len(pairs)} couples → {path} ({', '.join(f'{k} : {v}' for k, v in counts.items())})")
         return path
 
+    @_tracked
     def evaluate(self, period: str = "test", matcher: str = "null") -> dict:
         """Compare les décisions d'un rejeu aux imputations réelles ; écrit les rapports."""
         settings = self.settings
@@ -6592,6 +7009,7 @@ class Project:
         (rep / f"{out}.md").write_text(render_markdown(summary, tables, context), encoding="utf-8")
         return {"summary": summary, **tables}
 
+    @_tracked
     def backtest(self, period: str = "test", matcher: str = "pipeline") -> dict:
         """Rejeu puis évaluation (étape 6)."""
         self.replay(period, matcher)
@@ -6787,6 +7205,19 @@ reconcile_ml:
     min_data_in_leaf: 50
     # Graine (reproductibilité).
     seed: 42
+    # Scores de pass 1 du train qui nourrissent les features de compétition de la pass 2.
+    # walk_forward : chaque mois est scoré par un modèle appris sur le seul passé, avec les labels
+    # connus à cette date, comme en production. random_folds : version précédente, 3 folds tirés
+    # par paiement (un modèle de fold voit le futur du train : fuite F4, docs/fuites_ml.md).
+    oof_scheme: walk_forward
+    # Walk-forward : un modèle tous les N mois, qui score les N mois suivants. N plus grand =
+    # apprentissage plus rapide.
+    walk_forward_step_months: 1
+    # Walk-forward : fenêtre d'apprentissage glissante, en mois. Vide = tout le passé disponible.
+    walk_forward_window_months:
+    # Walk-forward : paires positives minimales pour entraîner un modèle. Les mois sans modèle sont
+    # exclus de la pass 2.
+    walk_forward_min_positives: 50
     # Threads LightGBM (apprentissage et score). 0 = CPU utilisables du pod (quota cgroup), et non
     # les cœurs de la machine hôte.
     num_threads: 0

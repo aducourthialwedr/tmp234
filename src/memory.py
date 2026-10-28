@@ -17,6 +17,9 @@ Chaque relevé est **écrit et vidé immédiatement** dans un CSV : si le noyau 
 reste, et `by_phase(path)` / `chart(path)` montrent, dans un nouveau noyau, la phase où la mémoire a
 explosé. `tail -f` sur ce fichier depuis un terminal JupyterLab donne un suivi en direct.
 
+Les mêmes relevés donnent un **profil de temps** sans coût supplémentaire : `time_profile(path)` compte, par
+étape et sous-étape, le temps écoulé entre deux relevés (précision : l'intervalle, 1 s par défaut).
+
 `mark*` ne coûtent rien sans moniteur actif. Aucun appel réseau.
 """
 
@@ -25,6 +28,7 @@ from __future__ import annotations
 import csv
 import gc
 import os
+import re
 import sys
 import threading
 import time
@@ -137,6 +141,9 @@ def release_memory() -> None:
 
 
 # --- Phases (appelées depuis la pipeline) ----------------------------------------------------------------
+
+IDLE = "(inactif)"            # étape posée à la sortie des méthodes de `Project` : exclue du profil de temps
+
 
 def mark(sub: str) -> None:
     """Sous-étape en cours (signal d'allocation, règle, candidats ML...)."""
@@ -341,3 +348,55 @@ def chart(path: str | Path = "reports/memory.csv", session: int = -1):
         layers.append(alt.Chart(pd.DataFrame({"y": [limit.iloc[-1]]}))
                       .mark_rule(color="red", strokeDash=[4, 4]).encode(y="y:Q"))
     return alt.layer(*layers).properties(height=260, title="Mémoire (limite du pod en rouge)")
+
+
+# --- Profil de temps ------------------------------------------------------------------------------------------
+
+_NO_SUB = "(préparation, chargement, début de jour)"
+
+
+_VARIABLE = [(re.compile(r"\d{4}-\d{2}-\d{2}"), "date"), (re.compile(r"\(\d+/\d+\)"), "(n/n)"),
+             (re.compile(r"bloc \d+/\d+"), "bloc n/n"), (re.compile(r"\d[\d\s]* paires"), "n paires")]
+
+
+def _generic(label: str) -> str:
+    """Étiquette sans ses parties variables (bloc 2/5, 123 paires, date, 3/9) : les relevés d'une même phase se
+    cumulent. Les identifiants (R4, passe 1) sont gardés."""
+    for pattern, repl in _VARIABLE:
+        label = pattern.sub(repl, label)
+    return label.strip()
+
+
+def time_profile(path: str | Path = "reports/memory.csv", session: int | None = None) -> pd.DataFrame:
+    """Temps passé par (étape, sous-étape), lu sur les relevés du moniteur (toutes sessions par défaut).
+
+    Chaque relevé compte pour l'intervalle qui le sépare du suivant : coût nul (le moniteur tourne déjà),
+    précision de l'ordre de l'intervalle de relevé. Le temps d'inactivité entre deux méthodes de `Project`
+    (étape `IDLE`) est exclu."""
+    df = _session(read_history(path), session)
+    cols = ["étape", "sous-étape", "minutes", "part de l'étape", "part du total"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    nxt = df.groupby("session")["elapsed_s"].shift(-1)
+    df = df.assign(dt=(nxt - df["elapsed_s"]).clip(lower=0).fillna(0),
+                   sub=df["sub"].map(_generic).replace("", _NO_SUB), step=df["step"].map(_generic).replace("", IDLE))
+    df = df[df["step"] != IDLE]
+    out = df.groupby(["step", "sub"], sort=False)["dt"].sum().reset_index()
+    out["minutes"] = out["dt"] / 60
+    out["part de l'étape"] = out["minutes"] / out.groupby("step")["minutes"].transform("sum")
+    out["part du total"] = out["minutes"] / out["minutes"].sum()
+    order = {s: i for i, s in enumerate(out["step"].unique())}
+    out = out.assign(_o=out["step"].map(order)).sort_values(["_o", "minutes"], ascending=[True, False])
+    return out.rename(columns={"step": "étape", "sub": "sous-étape"})[cols].reset_index(drop=True)
+
+
+def time_chart(path: str | Path = "reports/memory.csv", session: int | None = None, top: int = 25):
+    """Barres du temps par sous-étape (altair), les `top` plus longues, colorées par étape."""
+    import altair as alt
+    prof = time_profile(path, session).nlargest(top, "minutes")
+    prof["phase"] = prof["étape"] + " › " + prof["sous-étape"]
+    return alt.Chart(prof).mark_bar().encode(
+        x=alt.X("minutes:Q"), y=alt.Y("phase:N", sort="-x", title=None), color=alt.Color("étape:N", legend=None),
+        tooltip=["étape", "sous-étape", alt.Tooltip("minutes:Q", format=".1f"),
+                 alt.Tooltip("part du total:Q", format=".0%")]).properties(height=22 * len(prof),
+                                                                            title="Temps par sous-étape")

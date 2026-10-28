@@ -3,8 +3,11 @@
 - Passe 1 : features des familles actives.
 - Features de compétition dérivées des scores de passe 1 au sein d'un même paiement : rang,
   marge au meilleur autre candidat, meilleur score concurrent. En entraînement, les scores de
-  passe 1 sont obtenus hors échantillon (validation croisée par paiement) pour ne pas biaiser
-  la passe 2.
+  passe 1 sont obtenus hors échantillon pour ne pas biaiser la passe 2 :
+  - `walk_forward` (par défaut dans les réglages) : chaque mois est scoré par un modèle appris sur
+    le seul passé, avec les labels connus à cette date, comme la production le verrait ;
+  - `random_folds` (version précédente) : 3 folds tirés par paiement ; un modèle de fold voit le
+    futur du train (fuite F4, docs/fuites_ml.md).
 - Passe 2 : features actives + compétition.
 - Calibration isotonique des scores de passe 2 sur la période de validation.
 
@@ -26,7 +29,7 @@ import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 
-from src import progress
+from src import memory, progress
 from src.memory import available_cpus
 from src.reconcile_ml.features import CATEGORICAL, COMPETITION
 from src.settings import TrainingSettings
@@ -71,12 +74,68 @@ def _train(X: pd.DataFrame, y: np.ndarray, Xv: pd.DataFrame | None, yv: np.ndarr
     cats = [c for c in CATEGORICAL if c in X.columns]
     train = lgb.Dataset(X, label=y, categorical_feature=cats, free_raw_data=True)
     valid = [lgb.Dataset(Xv, label=yv, categorical_feature=cats, reference=train)] if Xv is not None else []
+    memory.mark(label)
     with progress.task(f"{label} ({len(X)} paires)", cfg.num_boost_round, "itérations") as task:
         callbacks = [progress.lightgbm_callback(task)]
         if valid:
             callbacks.append(lgb.early_stopping(30, verbose=False))
         return lgb.train(_params(cfg), train, num_boost_round=cfg.num_boost_round, valid_sets=valid,
                          callbacks=callbacks)
+
+
+OOF_SCHEMES = ("walk_forward", "random_folds")
+
+
+def _labels_known(pairs: pd.DataFrame, imputations: pd.DataFrame) -> np.ndarray:
+    """Label de chaque paire (paiement, facture) d'après les seules imputations données."""
+    truth = imputations[["payment_id", "invoice_id"]].drop_duplicates().assign(_hit=1)
+    merged = pairs[["payment_id", "invoice_id"]].merge(truth, on=["payment_id", "invoice_id"], how="left")
+    return merged["_hit"].fillna(0).to_numpy(dtype=np.int8)
+
+
+def walk_forward_scores(train: pd.DataFrame, X: pd.DataFrame, rounds: int, cfg: TrainingSettings,
+                        imputations: pd.DataFrame, purge_days: int, retention_days: int) -> tuple[np.ndarray, list[dict]]:
+    """Scores de pass 1 du train, « comme en production ».
+
+    Aux dates Dₖ (débuts de mois, tous les `walk_forward_step_months`), un modèle est appris sur les paiements
+    arrivés avant Dₖ − purge (dans la fenêtre `walk_forward_window_months` si elle est fixée), avec les seuls
+    labels connus à Dₖ : imputations d'horodatage antérieur à Dₖ. Un paiement sans imputation connue à Dₖ et plus
+    récent que la rétention a une issue inconnue : il est écarté, pas compté négatif. Le modèle score les paires
+    des paiements arrivés dans [Dₖ, Dₖ₊₁). NaN : paire sans modèle (premier mois, trop peu de positifs).
+    """
+    day = pd.to_datetime(train["day"]).reset_index(drop=True)
+    month = day.dt.to_period("M").dt.start_time
+    starts = sorted(month.unique())
+    cutoffs = [pd.Timestamp(m) for m in starts[1::cfg.walk_forward_step_months]]
+    imp = imputations[["payment_id", "invoice_id", "updated_at"]].dropna()
+    imp_ts = pd.to_datetime(imp["updated_at"]).to_numpy()
+    purge, retention = pd.Timedelta(days=purge_days), pd.Timedelta(days=retention_days)
+    pairs = train[["payment_id", "invoice_id"]].reset_index(drop=True)
+    fixed = cfg.model_copy(update={"num_boost_round": rounds})
+    scores, log = np.full(len(train), np.nan), []
+    for k, d_k in enumerate(cutoffs):
+        end = cutoffs[k + 1] if k + 1 < len(cutoffs) else None
+        target = ((day >= d_k) & (day < end) if end is not None else (day >= d_k)).to_numpy()
+        seen = day < d_k - purge
+        if cfg.walk_forward_window_months:
+            seen &= day >= d_k - pd.DateOffset(months=cfg.walk_forward_window_months)
+        seen = seen.to_numpy()
+        known = imp[imp_ts < d_k.to_datetime64()]
+        labels = _labels_known(pairs[seen], known)
+        outcome = (pairs.loc[seen, "payment_id"].isin(known["payment_id"]).to_numpy()
+                   | (day[seen] < d_k - retention).to_numpy())
+        rows = np.flatnonzero(seen)[outcome]
+        n_pos = int(labels[outcome].sum())
+        entry = {"date": str(d_k.date()), "paires_apprises": int(len(rows)), "positifs": n_pos,
+                 "paires_scorees": int(target.sum())}
+        if n_pos < cfg.walk_forward_min_positives or not target.any():
+            log.append({**entry, "modele": False})
+            continue
+        model = _train(X.iloc[rows], labels[outcome], None, None, fixed,
+                       f"LightGBM passe 1, walk-forward {d_k.date()} ({k + 1}/{len(cutoffs)})")
+        scores[target] = model.predict(X[target], num_threads=threads(cfg.num_threads))
+        log.append({**entry, "modele": True})
+    return scores, log
 
 
 @dataclass
@@ -109,25 +168,44 @@ class PairModel:
 
     @classmethod
     def fit(cls, train: pd.DataFrame, valid: pd.DataFrame, features: list[str], cfg: TrainingSettings,
-            second_pass: bool = True, calibration: bool = True, folds: int = 3) -> PairModel:
+            second_pass: bool = True, calibration: bool = True, folds: int = 3, oof: str = "random_folds",
+            imputations: pd.DataFrame | None = None, purge_days: int = 5, retention_days: int = 60) -> PairModel:
+        """`oof` : schéma des scores de passe 1 du train pour la pass 2 (`OOF_SCHEMES`). `walk_forward` exige
+        `imputations` (payment_id, invoice_id, updated_at) et la colonne `day` du jeu."""
+        if oof not in OOF_SCHEMES:
+            raise ValueError(f"schéma OOF inconnu : {oof} ({', '.join(OOF_SCHEMES)})")
+        train = train.reset_index(drop=True)
         y, yv = train["label"].to_numpy(), valid["label"].to_numpy()
         X, Xv = train[features], valid[features]
         pass1 = _train(X, y, Xv, yv, cfg, "LightGBM passe 1")
-        pass2 = None
+        pass2, info = None, {"schema": oof}
         if second_pass:
-            # Scores de passe 1 hors échantillon sur l'entraînement (plis par paiement).
-            fold = (pd.util.hash_array(train[GROUP].astype(str).to_numpy()) % folds).astype(int)
-            oof = np.zeros(len(train))
-            fixed = cfg.model_copy(update={"num_boost_round": max(pass1.best_iteration, 10)})
-            for k in range(folds):
-                m = _train(X[fold != k], y[fold != k], None, None, fixed,
-                           f"LightGBM passe 1, pli {k + 1}/{folds} (scores hors échantillon)")
-                oof[fold == k] = m.predict(X[fold == k], num_threads=threads(cfg.num_threads))
-            X2 = pd.concat([X.reset_index(drop=True), competition_features(oof, train[GROUP].to_numpy())], axis=1)
+            rounds = max(pass1.best_iteration, 10)
+            used = np.ones(len(train), dtype=bool)
+            if oof == "walk_forward":
+                if imputations is None:
+                    raise ValueError("walk_forward : les imputations (dates des labels) sont nécessaires")
+                scores, log = walk_forward_scores(train, X, rounds, cfg, imputations, purge_days, retention_days)
+                used = ~np.isnan(scores)
+                info.update(mois=log, paires_pass2=int(used.sum()), paires_sans_score=int((~used).sum()))
+            if oof == "random_folds" or not used.any():
+                if oof == "walk_forward":            # aucun mois scoré (historique trop court) : repli signalé
+                    info["repli"] = "random_folds : aucun mois n'a assez d'historique pour un modèle walk-forward"
+                    used[:] = True
+                # Scores de passe 1 hors échantillon sur l'entraînement (plis par paiement).
+                fold = (pd.util.hash_array(train[GROUP].astype(str).to_numpy()) % folds).astype(int)
+                scores = np.zeros(len(train))
+                fixed = cfg.model_copy(update={"num_boost_round": rounds})
+                for k in range(folds):
+                    m = _train(X[fold != k], y[fold != k], None, None, fixed,
+                               f"LightGBM passe 1, pli {k + 1}/{folds} (scores hors échantillon)")
+                    scores[fold == k] = m.predict(X[fold == k], num_threads=threads(cfg.num_threads))
+            X2 = pd.concat([X[used].reset_index(drop=True),
+                            competition_features(scores[used], train.loc[used, GROUP].to_numpy())], axis=1)
             s1v = pass1.predict(Xv, num_threads=threads(cfg.num_threads))
             Xv2 = pd.concat([Xv.reset_index(drop=True), competition_features(s1v, valid[GROUP].to_numpy())], axis=1)
-            pass2 = _train(X2, y, Xv2, yv, cfg, "LightGBM passe 2")
-        model = cls(features, pass1, pass2, None)
+            pass2 = _train(X2, y[used], Xv2, yv, cfg, "LightGBM passe 2")
+        model = cls(features, pass1, pass2, None, {"oof": info})
         if calibration:
             raw_v = model.raw(valid, valid[GROUP].to_numpy())
             model.calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit(raw_v, yv)

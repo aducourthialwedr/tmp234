@@ -110,14 +110,18 @@ def lists_intersect(a, a_pos: np.ndarray, b, b_pos: np.ndarray) -> np.ndarray:
         lb = list_take(b, b_pos) if isinstance(b, pd.Series) else [v or [] for v in b.take(pa.array(b_pos)).to_pylist()]
         return np.fromiter((bool(set(x) & set(y)) for x, y in zip(la, lb)), dtype=bool, count=n)
 
-    def flat(arr: pa.Array, pos: np.ndarray) -> pd.DataFrame:
+    def flat(arr: pa.Array, pos: np.ndarray) -> tuple[np.ndarray, pa.Array]:
         taken = arr.take(pa.array(np.asarray(pos, dtype=np.int64)))
-        return pd.DataFrame({"line": pc.list_parent_indices(taken).to_numpy(zero_copy_only=False),
-                             "value": pc.list_flatten(taken).to_numpy(zero_copy_only=False)})
+        values = pc.fill_null(pc.list_flatten(taken).cast(pa.large_string()), "\x00")     # null = null, comme un set
+        return pc.list_parent_indices(taken).to_numpy(zero_copy_only=False).astype(np.int64), values
 
-    left, right = flat(a, a_pos), flat(b, b_pos)
+    (la, va), (lb, vb) = flat(a, a_pos), flat(b, b_pos)
     out = np.zeros(n, dtype=bool)
-    if len(left) and len(right):
-        common = left.merge(right.drop_duplicates(), on=["line", "value"])
-        out[common["line"].to_numpy(dtype=np.int64)] = True
+    if len(la) and len(lb):
+        # Valeurs codées en entiers (égalité exacte) ; une ligne est citée si un couple (ligne, code) est commun.
+        codes = pc.dictionary_encode(pa.concat_arrays([va, vb])).indices.to_numpy(zero_copy_only=False)
+        codes = codes.astype(np.int64)
+        width = int(codes.max()) + 1
+        left, right = la * width + codes[:len(la)], lb * width + codes[len(la):]
+        out[la[np.isin(left, right)]] = True
     return out

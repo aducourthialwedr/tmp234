@@ -23,7 +23,7 @@
 | F1 | Validation réutilisée pour cinq choix, puis pour mesurer leur qualité | `model.py`, `pipeline.py`, `decision.py` | **haute** | certain |
 | F2 | Attributs statiques photographiés à l'extraction (IBAN, noms, champs de facture) | `loader.py`, `indexes.py`, `features.py` | **haute** si les référentiels sont enrichis après coup | certain (mécanisme), déduit (impact) |
 | F3 | Étiquettes lues au-delà de la fin de la période ; purge de 5 jours | `pipeline.py:290-294`, `settings.yaml` | moyenne | certain |
-| F4 | Plis hors échantillon de la passe 2 tirés au hasard, pas dans le temps | `model.py:118-129` | moyenne | certain (mécanisme), déduit (impact) |
+| F4 | Plis hors échantillon de la passe 2 tirés au hasard, pas dans le temps | `model.py` | moyenne | **corrigé** : walk-forward par défaut (`oof_scheme`), ancien schéma disponible |
 | F5 | Imputation datée avant l'arrivée de son paiement : l'état à D la contient déjà | `events.py:122-124`, `state.py:237-265` | moyenne, dépend des données | certain (mécanisme) |
 | F6 | `taux_automatisation_à_précision_cible` : seuil choisi sur le test | `metrics.py:168-174`, `ui/views/evaluation.py:57-61` | moyenne (présentation) | certain |
 | F7 | Vocabulaires de catégories construits sur toutes les données | `features.py:100-107` | faible | certain |
@@ -143,6 +143,14 @@ deux blocs ».
 ---
 
 ## F4 — Plis hors échantillon non temporels (passe 2)
+
+> **Statut : corrigé.** Les scores OOF de la pass 2 sont désormais produits en walk-forward
+> (`reconcile_ml.training.oof_scheme: walk_forward`, `walk_forward_scores`, `src/reconcile_ml/model.py`) : chaque
+> mois du train est scoré par un modèle appris sur les paiements arrivés avant `Dₖ − purge`, avec les seuls labels
+> connus à `Dₖ` ; les paiements d'issue encore inconnue sont écartés. `walk_forward_step_months` règle la cadence
+> des modèles et `walk_forward_window_months` la fenêtre. L'ancien schéma reste disponible avec
+> `oof_scheme: random_folds` (c'est aussi le défaut d'un appel direct à `PairModel.fit`). Le constat ci-dessous
+> décrit ce schéma.
 
 **Constat [certain].** Les scores de passe 1 qui nourrissent les features de compétition du train sont
 obtenus par 3 plis tirés au hasard par `payment_id` (`src/reconcile_ml/model.py:119`). Pour prédire un

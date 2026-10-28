@@ -19,6 +19,7 @@ config/rules.yaml, éditables à la main ou depuis l'interface.
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import sys
@@ -50,6 +51,24 @@ def _stderr(message: str) -> None:
         print(message, file=sys.stderr, flush=True)
     except UnicodeEncodeError:                  # console Windows non UTF-8
         print(message.encode("ascii", "replace").decode(), file=sys.stderr, flush=True)
+
+
+def _tracked(method):
+    """Méthode longue de `Project` : son nom sert d'étape au suivi mémoire tant qu'aucun message « … » ne la précise,
+    et l'étape redevient `memory.IDLE` à la sortie de l'appel le plus externe (le profil de temps exclut l'inactivité
+    du notebook entre deux cellules)."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._depth = getattr(self, "_depth", 0) + 1
+        if self._depth == 1:
+            memory.mark_step(method.__name__)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._depth -= 1
+            if self._depth == 0:
+                memory.mark_step(memory.IDLE)
+    return wrapper
 
 
 def _clean(value: Any) -> Any:
@@ -131,6 +150,7 @@ class Project:
         return read_yaml(REPO_ROOT / "config" / "schema.synthetic.yaml"), source_dir, f"synthetic/{source_dir.name}"
     # </synthétique>
 
+    @_tracked
     def load(self, n_payments: int | None = None, seed: int = 42, regenerate: bool = False) -> dict:  # portable: def load(self) -> dict:
         """Charge les sources, normalise, construit le journal et le profil."""
         from src.load.events import build_journal, derive_imputed_amounts, journal_hash
@@ -214,6 +234,7 @@ class Project:
             return PipelineMatcher(state, settings, self.rules, PairModel.load(self.model_dir))
         raise ValueError(f"rapprocheur inconnu : {name} ({', '.join(MATCHERS)})")
 
+    @_tracked
     def replay(self, period: str = "test", matcher: str = "null") -> dict:
         """Rejoue la période jour par jour avec un rapprocheur ; écrit décisions et statistiques quotidiennes."""
         from src.timeline.loop import run_replay
@@ -249,6 +270,7 @@ class Project:
 
     # --- Étape 3 : allocation --------------------------------------------------------------------------------------
 
+    @_tracked
     def measure_allocation(self, period: str = "validation") -> dict:
         """Rejoue l'allocation sur la période et mesure le rappel (cible du brief : 99 %)."""
         from src.allocation.allocator import Allocator
@@ -281,6 +303,7 @@ class Project:
 
     # --- Étape 5 : apprentissage ----------------------------------------------------------------------------------
 
+    @_tracked
     def train(self, reuse_dataset: bool = False) -> dict:
         """Rejoue entraînement + validation, entraîne le modèle, calibre les seuils, sauvegarde.
 
@@ -291,6 +314,7 @@ class Project:
         return fit_ml(self.interim_dir, self.model_dir, self.settings, self.rules, log=self.log,
                       reuse_dataset=reuse_dataset)
 
+    @_tracked
     def calibrate(self) -> dict:
         """Recalcule les seuils de décision du modèle existant sur la validation, sans réentraîner."""
         from src.reconcile_ml.pipeline import recalibrate_ml
@@ -319,6 +343,7 @@ class Project:
         decisions = pd.read_parquet(self.interim_dir / "replay" / f"{tag}_decisions.parquet")
         return context, decisions, ground_truth(imputation), scope
 
+    @_tracked
     def export_decisions(self, period: str = "test", matcher: str = "pipeline", fmt: str = "parquet") -> Path:
         """Imputations proposées par un rejeu, une ligne par couple (paiement, facture), plus les couples
         réellement imputés non proposés : à joindre à la table d'imputation d'origine sur
@@ -338,6 +363,7 @@ class Project:
         self.log(f"  {len(pairs)} couples → {path} ({', '.join(f'{k} : {v}' for k, v in counts.items())})")
         return path
 
+    @_tracked
     def evaluate(self, period: str = "test", matcher: str = "null") -> dict:
         """Compare les décisions d'un rejeu aux imputations réelles ; écrit les rapports."""
         from src.evaluation.metrics import by_flag, evaluate, ml_diagnostics
@@ -371,6 +397,7 @@ class Project:
         (rep / f"{out}.md").write_text(render_markdown(summary, tables, context), encoding="utf-8")
         return {"summary": summary, **tables}
 
+    @_tracked
     def backtest(self, period: str = "test", matcher: str = "pipeline") -> dict:
         """Rejeu puis évaluation (étape 6)."""
         self.replay(period, matcher)

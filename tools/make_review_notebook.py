@@ -334,7 +334,8 @@ display(Markdown("**Les 15 premières features**"),
 
 ```
 pass 1      LightGBM binaire, 54 features, entraîné sur le train, early stopping sur la validation
-folds OOF   GroupKFold par paiement (3 folds) : chaque paire du train scorée par un modèle qui n'a pas vu son paiement
+scores OOF  walk-forward (défaut) : chaque mois du train scoré par un modèle appris sur le seul passé
+            (ancien schéma, oof_scheme: random_folds : GroupKFold par paiement, 3 folds)
 compétition rang, marge au meilleur concurrent, meilleur concurrent — calculés dans chaque paiement
             (train : à partir des scores OOF ; validation, test, production : à partir de la pass 1)
 pass 2      LightGBM binaire, 57 features, early stopping sur la validation → score brut, utilisé par la décision
@@ -584,7 +585,8 @@ trees, k-NN, réseaux de neurones selon le preset et les extras installés) et l
 - Quatre modèles :
   - LightGBM pass 1 ;
   - AutoGluon sur les mêmes 54 features ;
-  - LightGBM pass 2 (la configuration de production) ;
+  - LightGBM pass 2, le stacking de production. Ici, ses scores OOF sont tirés par folds, comme ceux qui nourrissent
+    « AutoGluon + compétition », pour comparer les modèles à armes égales ;
   - AutoGluon avec les 3 features de compétition (son équivalent de la pass 2, nourri par les mêmes scores OOF).
 - Deux niveaux de comparaison :
   - **par paire** : AUC, precision@1, MRR, log-loss ;
@@ -751,7 +753,7 @@ if CH:
     se = np.sqrt(ref * (1 - ref) / n_pos)
     gap = m.loc[best, "precision_at_1"] - ref
     if best == "LightGBM pass 2 (production)":
-        verdict_ = "la configuration de production reste la meilleure en precision@1."
+        verdict_ = "la pass 2 de LightGBM reste la meilleure en precision@1."
     else:
         verdict_ = (f"meilleur modèle `{best}`, {100 * gap:+.2f} pt par rapport à la production : "
                     + ("**écart significatif** (plus de 2 erreurs-types)." if gap > 2 * se else "**dans le bruit**."))
@@ -841,7 +843,7 @@ modèle de production."""),
     same = train[has].reset_index(drop=True)
     res["wf_log"] = pd.DataFrame(wf_log)
     res["oof_compare"] = pd.DataFrame({"in-sample": scores(same, s1_in[has]),
-                                       "GroupKFold aléatoire, OOF (code actuel)": scores(same, oof[has]),
+                                       "GroupKFold aléatoire, OOF (ancien schéma)": scores(same, oof[has]),
                                        "walk-forward (sans futur)": scores(same, wf[has])}).T
 
     print("  pass 2")
@@ -855,7 +857,7 @@ modèle de production."""),
     s2_same = pass2(same[feats], comp_tr[has], same["label"].to_numpy())
     s2_wf = pass2(same[feats], competition_features(wf[has], same[GROUP].to_numpy()), same["label"].to_numpy())
     res["pass2"] = pd.DataFrame({"pass 1 seule": scores(valid, s1_v),
-                                 "pass 2 · GroupKFold, tout le train (code actuel)": scores(valid, s2_all),
+                                 "pass 2 · GroupKFold, tout le train (ancien schéma)": scores(valid, s2_all),
                                  "pass 2 · GroupKFold, mêmes paires que le walk-forward": scores(valid, s2_same),
                                  "pass 2 · walk-forward": scores(valid, s2_wf)}).T
 
