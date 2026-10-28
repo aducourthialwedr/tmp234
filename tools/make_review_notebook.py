@@ -31,7 +31,7 @@ décisions, tous sur le même journal.
 |---|---|---|
 | 1 | Le résultat | cascade actuel → règles → règles + ML, précision et intervalle de confiance, stabilité par mois |
 | 2 | La pipeline | boucle quotidienne, split temporel, allocation, règles |
-| 3 | Deep dive ML | candidats, features, stacking, décision, un paiement de bout en bout, validation contre test, calibration par la précision |
+| 3 | Deep dive ML | candidats, features, stacking, décision, un paiement de bout en bout, validation contre test, calibration par la précision, challenger AutoGluon |
 | 4 | Leakage | la théorie, puis la vérification : pas de leakage grossier, impact du leakage résiduel |
 | 5 | Évolutions | plan de correction et décisions à prendre |"""),
     ("code", r"""import json
@@ -59,14 +59,16 @@ try:                                   # dépôt complet
     from src.api import Project
     from src.evaluation.metrics import ground_truth
     from src.load.interim import load_interim
-    from src.reconcile_ml.decision import decide
+    from src.memory import available_cpus
+    from src.reconcile_ml.decision import calibrate_thresholds, decide
     from src.reconcile_ml.features import BASE, CATEGORICAL, FAMILIES
     from src.reconcile_ml.model import GROUP, PairModel, _params, competition_features, pair_metrics
     from src.reconcile_ml.pipeline import label_pairs, offline_proposals, online_thresholds
 except ModuleNotFoundError:            # version portable (single/)
-    from reconciliation import (BASE, CATEGORICAL, FAMILIES, GROUP, PairModel, Project, _params, competition_features,
-                                decide, ground_truth, label_pairs, load_interim, offline_proposals, online_thresholds,
-                                pair_metrics)
+    from reconciliation import (BASE, CATEGORICAL, FAMILIES, GROUP, PairModel, Project, _params, calibrate_thresholds,
+                                competition_features, decide, ground_truth, label_pairs, load_interim, memory,
+                                offline_proposals, online_thresholds, pair_metrics)
+    available_cpus = memory.available_cpus
 
 import warnings
 warnings.filterwarnings("ignore", message="invalid value encountered in cast")
@@ -77,6 +79,9 @@ alt.data_transformers.disable_max_rows()"""),
 PREPARE = False           # True la veille (calculs longs mis en cache) ; False en séance (lecture du cache)
 TRAIN_PAYMENTS = 40_000   # paiements du train tirés pour les expériences de leakage (§ 4)
 VALID_PAYMENTS = 15_000   # paiements de la validation tirés pour ces expériences
+AUTOGLUON_PYTHON = None   # challenger (§ 3.8) : Python d'un environnement séparé où AutoGluon est installé
+AUTOGLUON_PRESET = "medium_quality"   # presets avec bagging refusés (folds non groupés par paiement)
+AUTOGLUON_TIME_LIMIT = 1200           # secondes par modèle AutoGluon (deux modèles)
 SEED = 42"""),
     ("code", r"""project = Project(dataset=DATASET, log=print)
 settings = project.settings
@@ -141,7 +146,40 @@ checks = [
     ("jeu de paires du ML", DS is not None, "project.train()"),
 ]
 display(pd.DataFrame([(a, "oui" if b else "NON", c) for a, b, c in checks],
-                     columns=["prérequis", "ok", "détail ou commande à lancer"]))"""),
+                     columns=["prérequis", "ok", "détail ou commande à lancer"]))
+
+FEATS = MODEL_META["features"] if MODEL_META else []
+CATS = [c for c in CATEGORICAL if c in FEATS]
+
+
+def sample_pairs(period: str, n: int, columns=None) -> pd.DataFrame:
+    # Paiements entiers tirés au hasard (graine fixe) dans une période du dataset de training.
+    ids = pc.unique(DS.to_table(columns=["payment_id"], filter=pads.field("period") == period)["payment_id"])
+    take = np.sort(np.random.default_rng(SEED).choice(len(ids), size=min(n, len(ids)), replace=False))
+    df = DS.to_table(columns=columns, filter=(pads.field("period") == period)
+                     & pads.field("payment_id").isin(ids.take(pa.array(take)))).to_pandas()
+    df["month"] = df["month"].astype(str)
+    return (df.drop_duplicates(["payment_id", "invoice_id"])
+            .sort_values(["day", "payment_id", "invoice_id"], kind="mergesort").reset_index(drop=True))
+
+
+def lgb_fit(Xd, yd, rounds=None, Xval=None, yval=None):
+    # LightGBM avec les hyperparamètres de production ; early stopping si un jeu de validation est donné.
+    cfg = settings.reconcile_ml.training
+
+    def dset(Xs, ys, ref=None):
+        return lgb.Dataset(Xs, label=ys, categorical_feature=[c for c in CATS if c in Xs.columns], free_raw_data=False,
+                           reference=ref)
+
+    d = dset(Xd, yd)
+    if Xval is None:
+        return lgb.train(_params(cfg), d, num_boost_round=rounds)
+    return lgb.train(_params(cfg), d, num_boost_round=cfg.num_boost_round, valid_sets=[dset(Xval, yval, d)],
+                     callbacks=[lgb.early_stopping(30, verbose=False)])
+
+
+def scores(df: pd.DataFrame, s: np.ndarray) -> dict:
+    return {**pair_metrics(df, s), "logloss": log_loss(df["label"], np.clip(s, 1e-7, 1 - 1e-7), labels=[0, 1])}"""),
 
     # --- 1. Résultat -----------------------------------------------------------------------------------------
     ("md", r"""## 1. Le résultat
@@ -532,6 +570,196 @@ if PC is not None:
     if charts:
         display(alt.hconcat(*charts))"""),
 
+    ("md", r"""### 3.8 Challenger : AutoGluon contre LightGBM
+
+**La question.** LightGBM avec des hyperparamètres standard laisse-t-il de la performance sur la table ? AutoGluon
+(`TabularPredictor`) essaie plusieurs familles de modèles (LightGBM, CatBoost, XGBoost, forêts aléatoires, extra
+trees, k-NN, réseaux de neurones selon le preset et les extras installés) et les combine par ensembling.
+
+**Protocole, identique pour tous les modèles.**
+- Même échantillon de paiements (`TRAIN_PAYMENTS`, `VALID_PAYMENTS`) et mêmes features.
+- La validation est coupée dans le temps en deux moitiés :
+  - **V1** sert à l'early stopping de LightGBM et au tuning et à l'ensembling d'AutoGluon (`tuning_data`) ;
+  - **V2** sert uniquement à l'évaluation.
+- Quatre modèles :
+  - LightGBM pass 1 ;
+  - AutoGluon sur les mêmes 54 features ;
+  - LightGBM pass 2 (la configuration de production) ;
+  - AutoGluon avec les 3 features de compétition (son équivalent de la pass 2, nourri par les mêmes scores OOF).
+- Deux niveaux de comparaison :
+  - **par paire** : AUC, precision@1, MRR, log-loss ;
+  - **par décision** : seuils choisis sur V1 avec la méthode offline, appliqués à V2 ; on compare le taux
+    d'auto-validation et la précision.
+
+**Comment lire le résultat.** AutoGluon doit battre la pass 2 de LightGBM **de plus que le bruit** pour justifier son
+coût :
+- des ensembles non déterministes ;
+- un training et une inférence plus longs ;
+- des dépendances lourdes, **incompatibles avec l'environnement du projet** ;
+- une explicabilité réduite ;
+- des seuils à recalibrer.
+
+**Environnement séparé, obligatoire.** AutoGluon impose pandas < 2.4, alors que le projet utilise pandas 3 (chaînes
+Arrow). L'installer dans l'environnement du projet casse la normalisation. Le notebook exporte donc les données en
+parquet et lance AutoGluon dans **un autre Python**, par sous-processus. À préparer une fois :
+
+```
+python -m venv /chemin/venv-autogluon
+/chemin/venv-autogluon/bin/pip install "autogluon.tabular[all]" pyarrow     # Windows : venv-autogluon\Scripts\pip
+```
+
+Puis, dans la cellule de paramètres : `AUTOGLUON_PYTHON = "/chemin/venv-autogluon/bin/python"`.
+
+**Points pratiques.**
+- Sans les extras `[all]`, AutoGluon se limite aux modèles disponibles : le leaderboard dit lesquels ont tourné.
+- Les presets avec bagging (`good_quality` et au-dessus) tirent leurs folds au hasard, ligne par ligne : ils
+  mélangeraient les candidats d'un même paiement entre folds. Ils sont donc refusés ici.
+- Sur un petit échantillon, les seuils choisis sur V1 sont instables, et la précision par décision peut tomber sous la
+  cible pour tous les modèles. Il faut alors comparer les modèles **entre eux**, pas à la cible."""),
+    ("code", r"""AG_SCRIPT = '''
+# Exécuté dans l'environnement AutoGluon (pandas 2) : ne dépend pas du code du projet.
+import json, sys, time
+from pathlib import Path
+import pandas as pd
+import autogluon.core
+from autogluon.tabular import TabularPredictor
+
+d = Path(sys.argv[1])
+cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
+result = {"version": autogluon.core.__version__, "timings": {}}
+for name, cols in cfg["models"].items():
+    def load(part, with_label):
+        df = pd.read_parquet(d / f"{part}.parquet", columns=cols + (["label"] if with_label else []))
+        for c in cfg["categorical"]:
+            if c in df.columns:
+                df[c] = df[c].map(lambda v: "manquant" if pd.isna(v) else str(int(v)))
+        return df
+    train, v1, v2 = load("train", True), load("v1", True), load("v2", False)
+    t = time.perf_counter()
+    predictor = TabularPredictor(label="label", problem_type="binary", eval_metric="log_loss",
+                                 path=str(d / "models" / name), verbosity=1)
+    predictor.fit(train, tuning_data=v1, presets=cfg["preset"], time_limit=cfg["time_limit"], num_cpus=cfg["num_cpus"])
+    result["timings"][name] = time.perf_counter() - t
+    for part, df in (("v1", v1.drop(columns="label")), ("v2", v2)):
+        p = predictor.predict_proba(df, as_multiclass=False).to_numpy()
+        pd.DataFrame({"p": p}).to_parquet(d / f"pred_{name}_{part}.parquet", index=False)
+    board = predictor.leaderboard(silent=True)[["model", "score_val", "fit_time", "pred_time_val"]]
+    board.to_csv(d / f"leaderboard_{name}.csv", index=False)
+(d / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+'''
+
+
+def run_autogluon(folder: Path) -> dict:
+    import subprocess
+    script = folder / "run_autogluon.py"
+    script.write_text(AG_SCRIPT, encoding="utf-8")
+    python = AUTOGLUON_PYTHON or sys.executable
+    done = subprocess.run([str(python), str(script), str(folder)], capture_output=True, text=True)
+    if done.returncode != 0:
+        tail = (done.stderr or done.stdout)[-1500:]
+        raise RuntimeError("AutoGluon a échoué. Vérifier AUTOGLUON_PYTHON (environnement séparé, voir ci-dessus).\n" + tail)
+    return json.loads((folder / "result.json").read_text(encoding="utf-8"))
+
+
+def _challenger():
+    import time
+    if AUTOGLUON_PRESET.split("_")[0] in ("good", "high", "best", "extreme"):
+        raise ValueError(f"preset {AUTOGLUON_PRESET} : bagging par folds aléatoires, non groupés par paiement")
+    train, valid = sample_pairs("train", TRAIN_PAYMENTS), sample_pairs("validation", VALID_PAYMENTS)
+    vday = pd.to_datetime(valid["day"])
+    first_half = (vday < vday.min() + (vday.max() - vday.min()) / 2).to_numpy()
+    v1, v2 = valid[first_half].reset_index(drop=True), valid[~first_half].reset_index(drop=True)
+    X, y, y1 = train[FEATS], train["label"].to_numpy(), v1["label"].to_numpy()
+    timings, results = {}, {}
+
+    print("  LightGBM : pass 1, folds OOF, pass 2")
+    t = time.perf_counter()
+    p1 = lgb_fit(X, y, Xval=v1[FEATS], yval=y1)
+    rounds = max(p1.best_iteration, 10)
+    fold = (pd.util.hash_array(train[GROUP].astype(str).to_numpy()) % 3).astype(int)
+    oof = np.zeros(len(train))
+    for k in range(3):
+        oof[fold == k] = lgb_fit(X[fold != k], y[fold != k], rounds).predict(X[fold == k])
+    timings["LightGBM pass 1 (54 features)"] = time.perf_counter() - t
+    s1 = {"v1": p1.predict(v1[FEATS]), "v2": p1.predict(v2[FEATS])}
+
+    def with_comp(df, s):
+        return pd.concat([df[FEATS].reset_index(drop=True), competition_features(s, df[GROUP].to_numpy())], axis=1)
+
+    X2, X2v1, X2v2 = with_comp(train, oof), with_comp(v1, s1["v1"]), with_comp(v2, s1["v2"])
+    t = time.perf_counter()
+    p2 = lgb_fit(X2, y, Xval=X2v1, yval=y1)
+    timings["LightGBM pass 2 (production)"] = time.perf_counter() - t + timings["LightGBM pass 1 (54 features)"]
+    results["LightGBM pass 1 (54 features)"] = (s1["v1"], s1["v2"])
+    results["LightGBM pass 2 (production)"] = (p2.predict(X2v1), p2.predict(X2v2))
+
+    print(f"  AutoGluon (environnement séparé) : preset {AUTOGLUON_PRESET}, {AUTOGLUON_TIME_LIMIT} s par modèle")
+    folder = REVIEW_DIR / "autogluon"
+    folder.mkdir(parents=True, exist_ok=True)
+    X2.assign(label=y).to_parquet(folder / "train.parquet", index=False)
+    X2v1.assign(label=y1).to_parquet(folder / "v1.parquet", index=False)
+    X2v2.to_parquet(folder / "v2.parquet", index=False)
+    comp = [c for c in X2.columns if c not in FEATS]
+    models = {"base": ("AutoGluon (54 features)", FEATS), "comp": ("AutoGluon + compétition (57 features)", FEATS + comp)}
+    (folder / "config.json").write_text(json.dumps({
+        "categorical": CATS, "preset": AUTOGLUON_PRESET, "time_limit": AUTOGLUON_TIME_LIMIT, "num_cpus": available_cpus(),
+        "models": {key: cols for key, (_, cols) in models.items()}}), encoding="utf-8")
+    ag = run_autogluon(folder)
+    boards = {}
+    for key, (name, _) in models.items():
+        results[name] = tuple(pd.read_parquet(folder / f"pred_{key}_{part}.parquet")["p"].to_numpy() for part in ("v1", "v2"))
+        timings[name] = ag["timings"][key]
+        boards[name] = pd.read_csv(folder / f"leaderboard_{key}.csv").head(8)
+
+    truth = valid[valid["label"] == 1].groupby("payment_id")["invoice_id"].agg(lambda s: tuple(sorted(s)))
+
+    def exact(props: pd.DataFrame) -> np.ndarray:
+        return np.array([truth.get(pid) == inv for pid, inv in zip(props["payment_id"], props["invoice_ids"])])
+
+    n_v2 = v2["payment_id"].nunique()
+    metrics, decisions = {}, {}
+    for name, (sa, sb) in results.items():
+        metrics[name] = {**scores(v2, sb), "training (s)": timings[name]}
+        props_a, _ = offline_proposals(v1, sa, settings)
+        th = calibrate_thresholds(props_a, exact(props_a), settings.evaluation.target_precision, settings.reconcile_ml.decision)
+        props_b, _ = offline_proposals(v2, sb, settings)
+        auto = decide(props_b, th) == "auto"
+        ok = exact(props_b)[auto]
+        n, k = int(auto.sum()), int(ok.sum())
+        decisions[name] = {"auto-validations": n, "taux d'auto-validation": n / n_v2, "précision": k / n if n else np.nan,
+                           "borne basse 95 %": beta.ppf(0.05, k, n - k + 1) if k else np.nan}
+    return {"metrics": pd.DataFrame(metrics).T, "decisions": pd.DataFrame(decisions).T, "boards": boards,
+            "version": ag["version"], "preset": AUTOGLUON_PRESET, "time_limit": AUTOGLUON_TIME_LIMIT,
+            "volumes": {"paires train": len(train), "paires V1": len(v1), "paires V2": len(v2), "paiements V2": n_v2}}
+
+
+CH = cached("autogluon", _challenger) if DS is not None else None
+if CH:
+    vol = CH["volumes"]
+    display(Markdown(f"AutoGluon {CH['version']}, preset `{CH['preset']}`, au plus {CH['time_limit']} s par modèle · "
+                     f"{num(vol['paires train'])} paires de train, tuning sur {num(vol['paires V1'])} paires (V1), "
+                     f"évaluation sur {num(vol['paires V2'])} paires (V2, {num(vol['paiements V2'])} paiements)."))
+    m = CH["metrics"]
+    display(Markdown("**Par paire, sur V2**"), m[["auc", "precision_at_1", "mrr", "logloss", "training (s)"]].style.format(
+        {"auc": "{:.4f}", "precision_at_1": pct, "mrr": "{:.3f}", "logloss": "{:.4f}", "training (s)": "{:.0f}"}))
+    display(Markdown("**Par décision** : seuils choisis sur V1 (méthode offline), appliqués à V2"),
+            CH["decisions"].style.format({"auto-validations": num, "taux d'auto-validation": pct, "précision": pct,
+                                          "borne basse 95 %": pct}, na_rep="—"))
+    best = m["precision_at_1"].idxmax()
+    ref = m.loc["LightGBM pass 2 (production)", "precision_at_1"]
+    n_pos = m.loc["LightGBM pass 2 (production)", "groupes_avec_positif"]
+    se = np.sqrt(ref * (1 - ref) / n_pos)
+    gap = m.loc[best, "precision_at_1"] - ref
+    if best == "LightGBM pass 2 (production)":
+        verdict_ = "la configuration de production reste la meilleure en precision@1."
+    else:
+        verdict_ = (f"meilleur modèle `{best}`, {100 * gap:+.2f} pt par rapport à la production : "
+                    + ("**écart significatif** (plus de 2 erreurs-types)." if gap > 2 * se else "**dans le bruit**."))
+    display(Markdown(f"Erreur-type de la precision@1 sur V2 : **±{100 * se:.2f} pt** ; {verdict_}"))
+    for name, board in CH["boards"].items():
+        display(Markdown(f"**Leaderboard {name}** (`score_val` = −log-loss sur V1)"),
+                board.style.format({"score_val": "{:.5f}", "fit_time": "{:.0f}", "pred_time_val": "{:.1f}"}).hide(axis="index"))"""),
+
     # --- 4. Leakage ------------------------------------------------------------------------------------------
     ("md", r"""## 4. Leakage : la théorie, puis la vérification
 
@@ -554,37 +782,11 @@ Les expériences qui suivent sont faites sur un **échantillon** de paiements du
 `TRAIN_PAYMENTS`, `VALID_PAYMENTS`), avec les hyperparamètres de production. Elles mesurent des mécanismes, pas le
 modèle de production."""),
     ("code", r"""def _experiments():
-    feats = MODEL_META["features"]
-    cats = [c for c in CATEGORICAL if c in feats]
+    feats = FEATS
     cols = feats + ["payment_id", "invoice_id", "label", "group", "period", "day", "month"]
-
-    def sample(period: str, n: int) -> pd.DataFrame:
-        ids = pc.unique(DS.to_table(columns=["payment_id"], filter=pads.field("period") == period)["payment_id"])
-        take = np.sort(np.random.default_rng(SEED).choice(len(ids), size=min(n, len(ids)), replace=False))
-        df = DS.to_table(columns=cols, filter=(pads.field("period") == period)
-                         & pads.field("payment_id").isin(ids.take(pa.array(take)))).to_pandas()
-        df["month"] = df["month"].astype(str)
-        return (df.drop_duplicates(["payment_id", "invoice_id"])
-                .sort_values(["day", "payment_id", "invoice_id"], kind="mergesort").reset_index(drop=True))
-
-    train, valid = sample("train", TRAIN_PAYMENTS), sample("validation", VALID_PAYMENTS)
-    cfg = settings.reconcile_ml.training
-    params = _params(cfg)
+    train, valid = sample_pairs("train", TRAIN_PAYMENTS, cols), sample_pairs("validation", VALID_PAYMENTS, cols)
     X, y, Xv, yv = train[feats], train["label"].to_numpy(), valid[feats], valid["label"].to_numpy()
-
-    def scores(df, s):
-        return {**pair_metrics(df, s), "logloss": log_loss(df["label"], np.clip(s, 1e-7, 1 - 1e-7), labels=[0, 1])}
-
-    def dset(Xd, yd, ref=None):
-        return lgb.Dataset(Xd, label=yd, categorical_feature=[c for c in cats if c in Xd.columns], free_raw_data=False,
-                           reference=ref)
-
-    def fit(Xd, yd, rounds=None, Xval=None, yval=None):
-        d = dset(Xd, yd)
-        if Xval is None:
-            return lgb.train(params, d, num_boost_round=rounds)
-        return lgb.train(params, d, num_boost_round=cfg.num_boost_round, valid_sets=[dset(Xval, yval, d)],
-                         callbacks=[lgb.early_stopping(30, verbose=False)])
+    fit = lgb_fit
 
     res = {"volumes": {"paiements train": train["payment_id"].nunique(), "paires train": len(train),
                        "paiements validation": valid["payment_id"].nunique(), "paires validation": len(valid)}}
