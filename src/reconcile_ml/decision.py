@@ -56,12 +56,14 @@ def propose(scored: pd.DataFrame, amount: np.ndarray, cfg: SetSettings) -> pd.Da
             k = min(b - a, cfg.max_candidates)
             sols, _ = near_subsets(bal[a:a + k], amt, int(tol), max_size=cfg.max_invoices,
                                    node_budget=cfg.node_budget, max_solutions=20)
-            ranked = sorted(sols, key=lambda sol: (len(sol), -float(np.mean(p[a:a + k][list(sol)]))))
-            exact = [sol for sol in ranked if abs(amt - int(bal[a:a + k][list(sol)].sum())) <= cfg.tolerance_abs_cents]
+            # Moyennes et sommes en Python : quelques éléments par solution, des centaines de milliers de solutions.
+            pk, bk = p[a:a + k].tolist(), bal[a:a + k].tolist()
+            mean = {sol: sum(pk[i] for i in sol) / len(sol) for sol in sols}
+            ranked = sorted(sols, key=lambda sol: (len(sol), -mean[sol]))
+            exact = [sol for sol in ranked if abs(amt - sum(bk[i] for i in sol)) <= cfg.tolerance_abs_cents]
             for sol in list(dict.fromkeys(ranked[:2] + exact[:1])):
                 idx = a + np.array(sol)
-                props.append((float(np.mean(p[idx])), tuple(int(i) for i in inv[idx]),
-                              tuple(int(x) for x in bal[idx]), "set"))
+                props.append((mean[sol], tuple(int(i) for i in inv[idx]), tuple(int(x) for x in bal[idx]), "set"))
         if not props:
             continue
         props.sort(key=lambda x: (-x[0], len(x[1])))

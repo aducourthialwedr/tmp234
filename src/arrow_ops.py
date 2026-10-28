@@ -49,11 +49,13 @@ def lookup(keys: pd.Series, index_keys: pd.Series, values: pd.Series) -> pd.Seri
 # octets par élément au lieu d'une liste Python et d'un objet chaîne par élément (÷ 8 environ). Les
 # fonctions ci-dessous acceptent les deux formes (Arrow ou listes Python, comme dans les tests).
 
-def _list_array(values: pd.Series) -> pa.Array | None:
-    """Tableau Arrow de listes si la colonne est en Arrow, sinon None."""
+def _list_array(values: pd.Series) -> pa.Array | pa.ChunkedArray | None:
+    """Tableau Arrow de listes si la colonne est en Arrow, sinon None.
+
+    Les blocs ne sont pas fusionnés : `combine_chunks` recopierait toute la colonne à chaque appel, et
+    `list_take` est appelé chaque jour du replay, warm-up compris (coût proportionnel à la taille des tables)."""
     if isinstance(values, pd.Series) and isinstance(values.dtype, pd.ArrowDtype):
-        arr = values.array._pa_array
-        return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+        return values.array._pa_array
     return None
 
 
@@ -83,3 +85,39 @@ def list_take(values: pd.Series, positions: np.ndarray) -> list:
         return [v or [] for v in arr.take(pa.array(np.asarray(positions, dtype=np.int64))).to_pylist()]
     col = values.to_numpy()
     return [col[p] if isinstance(col[p], (list, tuple, np.ndarray)) else [] for p in positions]
+
+
+def lists_source(values: pd.Series):
+    """Colonne de listes prête pour des lectures répétées : tableau Arrow d'un seul bloc (fusionné une fois),
+    ou la série elle-même si les listes sont en Python. À calculer une fois, pas à chaque lecture : un `take`
+    sur un tableau en plusieurs blocs recopie la colonne entière."""
+    arr = _list_array(values)
+    if arr is None:
+        return values
+    return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+
+
+def lists_intersect(a, a_pos: np.ndarray, b, b_pos: np.ndarray) -> np.ndarray:
+    """Pour chaque i : les listes a[a_pos[i]] et b[b_pos[i]] ont-elles un élément commun ?
+
+    `a`, `b` : sorties de `lists_source`. En Arrow, sans aucune liste Python : on aplatit les seules lignes
+    demandées et on joint (ligne, valeur)."""
+    n = len(a_pos)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    if not (isinstance(a, pa.Array) and isinstance(b, pa.Array)):
+        la = list_take(a, a_pos) if isinstance(a, pd.Series) else [v or [] for v in a.take(pa.array(a_pos)).to_pylist()]
+        lb = list_take(b, b_pos) if isinstance(b, pd.Series) else [v or [] for v in b.take(pa.array(b_pos)).to_pylist()]
+        return np.fromiter((bool(set(x) & set(y)) for x, y in zip(la, lb)), dtype=bool, count=n)
+
+    def flat(arr: pa.Array, pos: np.ndarray) -> pd.DataFrame:
+        taken = arr.take(pa.array(np.asarray(pos, dtype=np.int64)))
+        return pd.DataFrame({"line": pc.list_parent_indices(taken).to_numpy(zero_copy_only=False),
+                             "value": pc.list_flatten(taken).to_numpy(zero_copy_only=False)})
+
+    left, right = flat(a, a_pos), flat(b, b_pos)
+    out = np.zeros(n, dtype=bool)
+    if len(left) and len(right):
+        common = left.merge(right.drop_duplicates(), on=["line", "value"])
+        out[common["line"].to_numpy(dtype=np.int64)] = True
+    return out

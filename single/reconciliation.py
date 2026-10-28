@@ -46,6 +46,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, timedelta
 from enum import Enum
+from functools import lru_cache
 from itertools import chain
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -523,11 +524,13 @@ def lookup(keys: pd.Series, index_keys: pd.Series, values: pd.Series) -> pd.Seri
 # octets par élément au lieu d'une liste Python et d'un objet chaîne par élément (÷ 8 environ). Les
 # fonctions ci-dessous acceptent les deux formes (Arrow ou listes Python, comme dans les tests).
 
-def _list_array(values: pd.Series) -> pa.Array | None:
-    """Tableau Arrow de listes si la colonne est en Arrow, sinon None."""
+def _list_array(values: pd.Series) -> pa.Array | pa.ChunkedArray | None:
+    """Tableau Arrow de listes si la colonne est en Arrow, sinon None.
+
+    Les blocs ne sont pas fusionnés : `combine_chunks` recopierait toute la colonne à chaque appel, et
+    `list_take` est appelé chaque jour du replay, warm-up compris (coût proportionnel à la taille des tables)."""
     if isinstance(values, pd.Series) and isinstance(values.dtype, pd.ArrowDtype):
-        arr = values.array._pa_array
-        return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+        return values.array._pa_array
     return None
 
 
@@ -557,6 +560,42 @@ def list_take(values: pd.Series, positions: np.ndarray) -> list:
         return [v or [] for v in arr.take(pa.array(np.asarray(positions, dtype=np.int64))).to_pylist()]
     col = values.to_numpy()
     return [col[p] if isinstance(col[p], (list, tuple, np.ndarray)) else [] for p in positions]
+
+
+def lists_source(values: pd.Series):
+    """Colonne de listes prête pour des lectures répétées : tableau Arrow d'un seul bloc (fusionné une fois),
+    ou la série elle-même si les listes sont en Python. À calculer une fois, pas à chaque lecture : un `take`
+    sur un tableau en plusieurs blocs recopie la colonne entière."""
+    arr = _list_array(values)
+    if arr is None:
+        return values
+    return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+
+
+def lists_intersect(a, a_pos: np.ndarray, b, b_pos: np.ndarray) -> np.ndarray:
+    """Pour chaque i : les listes a[a_pos[i]] et b[b_pos[i]] ont-elles un élément commun ?
+
+    `a`, `b` : sorties de `lists_source`. En Arrow, sans aucune liste Python : on aplatit les seules lignes
+    demandées et on joint (ligne, valeur)."""
+    n = len(a_pos)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    if not (isinstance(a, pa.Array) and isinstance(b, pa.Array)):
+        la = list_take(a, a_pos) if isinstance(a, pd.Series) else [v or [] for v in a.take(pa.array(a_pos)).to_pylist()]
+        lb = list_take(b, b_pos) if isinstance(b, pd.Series) else [v or [] for v in b.take(pa.array(b_pos)).to_pylist()]
+        return np.fromiter((bool(set(x) & set(y)) for x, y in zip(la, lb)), dtype=bool, count=n)
+
+    def flat(arr: pa.Array, pos: np.ndarray) -> pd.DataFrame:
+        taken = arr.take(pa.array(np.asarray(pos, dtype=np.int64)))
+        return pd.DataFrame({"line": pc.list_parent_indices(taken).to_numpy(zero_copy_only=False),
+                             "value": pc.list_flatten(taken).to_numpy(zero_copy_only=False)})
+
+    left, right = flat(a, a_pos), flat(b, b_pos)
+    out = np.zeros(n, dtype=bool)
+    if len(left) and len(right):
+        common = left.merge(right.drop_duplicates(), on=["line", "value"])
+        out[common["line"].to_numpy(dtype=np.int64)] = True
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -2493,6 +2532,9 @@ class LedgerState:
         self.window_days = window_days
         self._inv = t["invoice"].reset_index(drop=True)
         self._pay = t["payment"].reset_index(drop=True)
+        # Listes lues chaque jour par les agrégats glissants : préparées une fois (voir `lists_source`).
+        self._pay_numbers = lists_source(self._pay["label_numbers"])
+        self._inv_keys = lists_source(self._inv["client_reference_keys"])
         self._agr = t["agreement"].reset_index(drop=True)
         self._parties = {r: t[r].reset_index(drop=True) for r in _ROLES}
         self._cf = t["client_file"].reset_index(drop=True) if "client_file" in t else None
@@ -2647,10 +2689,7 @@ class LedgerState:
         delay = (self._pay_value_day[pay] - self._inv_due_day[inv]).astype(np.float64)
         has_delay = np.abs(delay) < 1e6
         delay = np.where(has_delay, delay, 0.0)
-        pay_numbers = list_take(self._pay["label_numbers"], pay)
-        inv_keys = list_take(self._inv["client_reference_keys"], inv)
-        cited = np.fromiter((bool(set(n) & set(k)) for n, k in zip(pay_numbers, inv_keys)),
-                            dtype=bool, count=len(pay))
+        cited = lists_intersect(self._pay_numbers, pay, self._inv_keys, inv)
         values = np.zeros((len(lines), _N_WIN))
         values[:, _W_PAYMENTS] = first_of_pay
         values[:, _W_LINES] = 1
@@ -4473,12 +4512,16 @@ Parcours en profondeur sur les montants triés, avec élagage :
 - budget de nœuds épuisé → résultat « indéterminé ».
 
 On s'arrête dès la deuxième solution : l'unicité est tout ce qui compte pour valider.
+
+Le parcours ne dépend que des montants triés et des paramètres : il est mémorisé sur ces valeurs. Un paiement
+du reliquat, retesté chaque jour avec les mêmes factures ouvertes, n'est ainsi parcouru qu'une fois.
 """
 
 
 
 
 UNIQUE, NONE, AMBIGUOUS, BUDGET = "unique", "none", "ambiguous", "budget"
+CACHE_SIZE = 200_000          # parcours mémorisés (quelques centaines d'octets chacun)
 
 
 @dataclass(frozen=True)
@@ -4488,55 +4531,125 @@ class SubsetResult:
     nodes: int = 0
 
 
-def exact_subset(amounts: np.ndarray, target: int, max_size: int = 5, min_size: int = 1,
-                 node_budget: int = 100_000) -> SubsetResult:
-    """Sous-ensemble unique de `amounts` (entiers > 0) sommant exactement à `target`."""
+def _sorted(amounts: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]:
     values = np.asarray(amounts, dtype=np.int64)
     order = np.argsort(values, kind="stable")
-    a = values[order].tolist()
+    return order, tuple(values[order].tolist())
+
+
+@lru_cache(maxsize=CACHE_SIZE)
+def _exact_sorted(a: tuple[int, ...], target: int, max_size: int, min_size: int,
+                  node_budget: int) -> tuple[str, tuple[int, ...], int]:
+    """Parcours sur les montants triés `a` : (statut, solution en positions de `a`, nœuds)."""
     n = len(a)
-    if n == 0 or target <= 0:
-        return SubsetResult(NONE)
-    # suffix_max[i][k] n'est pas nécessaire : borne supérieure = somme des k plus grands à partir de i,
-    # soit les k derniers éléments (tableau trié).
+    # Borne supérieure = somme des k plus grands à partir de i, soit les k derniers éléments (tableau trié).
     top = [0] * (max_size + 1)
     for k in range(1, max_size + 1):
         top[k] = sum(a[-k:]) if k <= n else sum(a)
+    # Bornes indexées par la profondeur : top[min(max_size - profondeur - 1, n)].
+    bound = [top[min(max_size - d - 1, n)] if d + 1 < max_size else 0 for d in range(max_size)]
     solutions: list[tuple[int, ...]] = []
     nodes = 0
-    stack: list[int] = []
-
-    def dfs(start: int, total: int) -> bool:
-        """Retourne False pour interrompre (deux solutions ou budget épuisé)."""
-        nonlocal nodes
-        depth = len(stack)
-        for i in range(start, n):
-            nodes += 1
-            if nodes > node_budget:
-                return False
-            s = total + a[i]
-            if s > target:
+    # Parcours en profondeur itératif (même ordre de visite et même décompte de nœuds que la version
+    # récursive) : `chosen` = indices retenus, `frames` = (index, total) du parent à chaque profondeur.
+    chosen: list[int] = []
+    frames: list[tuple[int, int]] = []
+    i, total, completed = 0, 0, True
+    while True:
+        if i >= n:                                      # fin de boucle à cette profondeur : retour au parent
+            if not frames:
                 break
-            stack.append(i)
-            if s == target and depth + 1 >= min_size:
-                solutions.append(tuple(stack))
-                if len(solutions) > 1:
-                    return False
-            elif depth + 1 < max_size:
-                remaining = max_size - depth - 1
-                if s + top[min(remaining, n)] >= target and not dfs(i + 1, s):
-                    return False
-            stack.pop()
-        return True
-
-    completed = dfs(0, 0)
+            i, total = frames.pop()
+            chosen.pop()
+            i += 1
+            continue
+        nodes += 1
+        if nodes > node_budget:
+            completed = False
+            break
+        s = total + a[i]
+        if s > target:                                  # montants croissants : rien au-delà
+            i = n
+            continue
+        depth = len(frames)
+        chosen.append(i)
+        if s == target and depth + 1 >= min_size:
+            solutions.append(tuple(chosen))
+            if len(solutions) > 1:
+                completed = False
+                break
+        elif depth + 1 < max_size and s + bound[depth] >= target:
+            frames.append((i, total))                   # descente
+            i, total = i + 1, s
+            continue
+        chosen.pop()
+        i += 1
     if len(solutions) > 1:
-        return SubsetResult(AMBIGUOUS, nodes=nodes)
+        return AMBIGUOUS, (), nodes
     if not completed:
-        return SubsetResult(BUDGET, nodes=nodes)
+        return BUDGET, (), nodes
     if not solutions:
-        return SubsetResult(NONE, nodes=nodes)
-    return SubsetResult(UNIQUE, tuple(sorted(int(order[i]) for i in solutions[0])), nodes)
+        return NONE, (), nodes
+    return UNIQUE, solutions[0], nodes
+
+
+def exact_subset(amounts: np.ndarray, target: int, max_size: int = 5, min_size: int = 1,
+                 node_budget: int = 100_000) -> SubsetResult:
+    """Sous-ensemble unique de `amounts` (entiers > 0) sommant exactement à `target`."""
+    order, a = _sorted(amounts)
+    if len(a) == 0 or target <= 0:
+        return SubsetResult(NONE)
+    status, solution, nodes = _exact_sorted(a, int(target), int(max_size), int(min_size), int(node_budget))
+    if status != UNIQUE:
+        return SubsetResult(status, nodes=nodes)
+    return SubsetResult(UNIQUE, tuple(sorted(int(order[i]) for i in solution)), nodes)
+
+
+@lru_cache(maxsize=CACHE_SIZE)
+def _near_sorted(a: tuple[int, ...], target: int, tolerance: int, max_size: int, min_size: int, node_budget: int,
+                 max_solutions: int) -> tuple[tuple[tuple[int, ...], ...], bool]:
+    """Parcours sur les montants triés `a` : (solutions en positions de `a`, dans l'ordre du parcours ; complet ?)."""
+    n = len(a)
+    lo, hi = target - tolerance, target + tolerance
+    top = [sum(a[-k:]) if 0 < k <= n else sum(a) for k in range(max_size + 1)]
+    bound = [top[min(max_size - d - 1, n)] if d + 1 < max_size else 0 for d in range(max_size)]
+    solutions: list[tuple[int, ...]] = []
+    nodes = 0
+    # Même parcours que `_exact_sorted` (itératif, ordre et nœuds identiques à la version récursive), mais une
+    # solution n'arrête pas la descente : un ensemble plus grand peut aussi tomber dans la tolérance.
+    chosen: list[int] = []
+    frames: list[tuple[int, int]] = []
+    i, total, complete = 0, 0, True
+    while True:
+        if i >= n:
+            if not frames:
+                break
+            i, total = frames.pop()
+            chosen.pop()
+            i += 1
+            continue
+        nodes += 1
+        if nodes > node_budget:
+            complete = False
+            break
+        s = total + a[i]
+        if s > hi:
+            i = n
+            continue
+        depth = len(frames)
+        chosen.append(i)
+        if s >= lo and depth + 1 >= min_size:
+            solutions.append(tuple(chosen))
+            if len(solutions) >= max_solutions:
+                complete = False
+                break
+        if depth + 1 < max_size and s + bound[depth] >= lo:
+            frames.append((i, total))
+            i, total = i + 1, s
+            continue
+        chosen.pop()
+        i += 1
+    return tuple(solutions), complete
 
 
 def near_subsets(amounts: np.ndarray, target: int, tolerance: int, max_size: int = 5, min_size: int = 2,
@@ -4546,37 +4659,10 @@ def near_subsets(amounts: np.ndarray, target: int, tolerance: int, max_size: int
     Retourne (solutions en indices de `amounts`, parcours complet ?). Solutions triées par
     cardinalité croissante : la parcimonie évite les combinaisons fortuites.
     """
-    values = np.asarray(amounts, dtype=np.int64)
-    order = np.argsort(values, kind="stable")
-    a = values[order].tolist()
-    n = len(a)
-    lo, hi = target - tolerance, target + tolerance
-    top = [sum(a[-k:]) if 0 < k <= n else sum(a) for k in range(max_size + 1)]
-    solutions: list[tuple[int, ...]] = []
-    nodes = 0
-    stack: list[int] = []
-
-    def dfs(start: int, total: int) -> bool:
-        nonlocal nodes
-        depth = len(stack)
-        for i in range(start, n):
-            nodes += 1
-            if nodes > node_budget:
-                return False
-            s = total + a[i]
-            if s > hi:
-                break
-            stack.append(i)
-            if s >= lo and depth + 1 >= min_size:
-                solutions.append(tuple(sorted(int(order[j]) for j in stack)))
-                if len(solutions) >= max_solutions:
-                    return False
-            if depth + 1 < max_size and s + top[min(max_size - depth - 1, n)] >= lo and not dfs(i + 1, s):
-                return False
-            stack.pop()
-        return True
-
-    complete = dfs(0, 0)
+    order, a = _sorted(amounts)
+    found, complete = _near_sorted(a, int(target), int(tolerance), int(max_size), int(min_size), int(node_budget),
+                                   int(max_solutions))
+    solutions = [tuple(sorted(int(order[j]) for j in sol)) for sol in found]
     solutions.sort(key=len)
     return solutions, complete
 
@@ -4779,26 +4865,36 @@ class RulesMatcher:
         owner, inv, balance = self.state.debtor_open_invoices_at(debtors, as_of)
         eff = self._effective(inv, balance)
         ok = eff > 0
-        by_debtor = pd.DataFrame({"debtor": debtors[owner[ok]], "inv": inv[ok], "balance": eff[ok]})
-        grouped = {d: (g["inv"].to_numpy(), g["balance"].to_numpy()) for d, g in by_debtor.groupby("debtor")}
+        owner, inv, eff = owner[ok], inv[ok], eff[ok]          # contigus par débiteur, dans l'ordre de `debtors`
+        first = np.searchsorted(owner, np.arange(len(debtors)), side="left")
+        last = np.searchsorted(owner, np.arange(len(debtors)), side="right")
         max_open = int(params.get("max_open_invoices", 30))
-        out = []
-        for row, group in scope.groupby("row"):
-            pools = [grouped[d] for d in group["debtor"] if d in grouped]
-            if not pools:
+        max_size, budget = int(params.get("max_invoices", 5)), int(params.get("node_budget", 100_000))
+        # Lignes du lot dans l'ordre, débiteurs de chaque ligne dans l'ordre de la portée.
+        order = np.argsort(scope["row"].to_numpy(), kind="stable")
+        rows_s = scope["row"].to_numpy()[order]
+        deb_s = np.searchsorted(debtors, scope["debtor"].to_numpy()[order])
+        bounds = np.r_[np.flatnonzero(np.r_[True, rows_s[1:] != rows_s[:-1]]), len(rows_s)]
+        out_row, out_inv, out_amt = [], [], []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            row = int(rows_s[a])
+            spans = [np.arange(first[k], last[k]) for k in deb_s[a:b] if last[k] > first[k]]
+            if not spans:
                 continue
-            invs = np.concatenate([p[0] for p in pools])
-            bals = np.concatenate([p[1] for p in pools])
-            fits = bals <= amount[row]
-            invs, bals = invs[fits], bals[fits]
-            if len(invs) == 0 or len(invs) > max_open:
+            idx = np.concatenate(spans)
+            idx = idx[eff[idx] <= amount[row]]
+            if len(idx) == 0 or len(idx) > max_open:
                 continue
-            res = exact_subset(bals, int(amount[row]), max_size=int(params.get("max_invoices", 5)),
-                               node_budget=int(params.get("node_budget", 100_000)))
+            res = exact_subset(eff[idx], int(amount[row]), max_size=max_size, node_budget=budget)
             if res.status == UNIQUE:
-                idx = list(res.indices)
-                out.append(pd.DataFrame({"row": row, "inv": invs[idx], "amount": bals[idx]}))
-        return pd.concat(out, ignore_index=True) if out else _no_proposal()
+                chosen = idx[list(res.indices)]
+                out_row.append(np.full(len(chosen), row, dtype=np.int64))
+                out_inv.append(inv[chosen])
+                out_amt.append(eff[chosen])
+        if not out_row:
+            return _no_proposal()
+        return pd.DataFrame({"row": np.concatenate(out_row), "inv": np.concatenate(out_inv),
+                             "amount": np.concatenate(out_amt)})
 
     # --- Journée ------------------------------------------------------------------------------------------
 
@@ -4846,10 +4942,14 @@ class RulesMatcher:
         if not chosen:
             return pd.DataFrame(columns=DECISION_COLUMNS)
         accepted = self._arbitrate(pd.concat(chosen, ignore_index=True), batch_ids, as_of)
-        for row, group in accepted.groupby("row"):
-            claims = list(zip(group["inv"].tolist(), group["amount"].tolist()))
-            self._claims.setdefault(int(pos[row]), []).extend(claims)
-            np.add.at(self._claimed, group["inv"].to_numpy(), group["amount"].to_numpy())
+        # Réservations par paiement (dans l'ordre des lignes, comme un groupby), sans itérer sur des groupes pandas.
+        rows_a, inv_a, amt_a = (accepted[c].to_numpy() for c in ("row", "inv", "amount"))
+        o = np.argsort(rows_a, kind="stable")
+        rows_s, inv_s, amt_s = rows_a[o], inv_a[o].tolist(), amt_a[o].tolist()
+        bounds = np.r_[np.flatnonzero(np.r_[True, rows_s[1:] != rows_s[:-1]]), len(rows_s)] if len(rows_s) else []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            self._claims.setdefault(int(pos[rows_s[a]]), []).extend(zip(inv_s[a:b], amt_s[a:b]))
+        np.add.at(self._claimed, inv_a.astype(np.int64), amt_a.astype(np.int64))
         return pd.DataFrame({
             "payment_id": batch_ids[accepted["row"].to_numpy()], "invoice_id": self._inv_ids[accepted["inv"].to_numpy()],
             "amount": pd.array(accepted["amount"].to_numpy(), dtype="Int64"), "action": AUTO, "step": "rules",
@@ -5167,7 +5267,8 @@ class Featurizer:
         due_gap = np.where(fits, due_gap, np.inf)
 
         def rank_by(key: np.ndarray) -> np.ndarray:
-            order = np.lexsort((c["inv"].to_numpy(), key, row))
+            # `c` est trié par (row, inv) (`_or_sources`) : un tri stable sur (row, key) départage déjà par facture.
+            order = np.lexsort((key, row))
             r = np.empty(len(row), dtype=np.int64)
             starts = np.flatnonzero(np.r_[True, row[order][1:] != row[order][:-1]]) if len(row) else np.array([], int)
             r[order] = np.arange(len(row)) - np.repeat(starts, np.diff(np.r_[starts, len(row)]))
@@ -5182,8 +5283,9 @@ class Featurizer:
 
     @staticmethod
     def _or_sources(c: pd.DataFrame) -> pd.DataFrame:
-        c = c.sort_values(["row", "inv"], kind="mergesort")
-        row, inv, src = c["row"].to_numpy(), c["inv"].to_numpy(), c["src"].to_numpy(dtype=np.int64)
+        order = np.lexsort((c["inv"].to_numpy(), c["row"].to_numpy()))     # stable, comme un tri pandas mergesort
+        row, inv = c["row"].to_numpy()[order], c["inv"].to_numpy()[order]
+        src = c["src"].to_numpy(dtype=np.int64)[order]
         starts = np.flatnonzero(np.r_[True, (row[1:] != row[:-1]) | (inv[1:] != inv[:-1])])
         return pd.DataFrame({"row": row[starts], "inv": inv[starts], "src": np.bitwise_or.reduceat(src, starts)})
 
@@ -5566,12 +5668,14 @@ def propose(scored: pd.DataFrame, amount: np.ndarray, cfg: SetSettings) -> pd.Da
             k = min(b - a, cfg.max_candidates)
             sols, _ = near_subsets(bal[a:a + k], amt, int(tol), max_size=cfg.max_invoices,
                                    node_budget=cfg.node_budget, max_solutions=20)
-            ranked = sorted(sols, key=lambda sol: (len(sol), -float(np.mean(p[a:a + k][list(sol)]))))
-            exact = [sol for sol in ranked if abs(amt - int(bal[a:a + k][list(sol)].sum())) <= cfg.tolerance_abs_cents]
+            # Moyennes et sommes en Python : quelques éléments par solution, des centaines de milliers de solutions.
+            pk, bk = p[a:a + k].tolist(), bal[a:a + k].tolist()
+            mean = {sol: sum(pk[i] for i in sol) / len(sol) for sol in sols}
+            ranked = sorted(sols, key=lambda sol: (len(sol), -mean[sol]))
+            exact = [sol for sol in ranked if abs(amt - sum(bk[i] for i in sol)) <= cfg.tolerance_abs_cents]
             for sol in list(dict.fromkeys(ranked[:2] + exact[:1])):
                 idx = a + np.array(sol)
-                props.append((float(np.mean(p[idx])), tuple(int(i) for i in inv[idx]),
-                              tuple(int(x) for x in bal[idx]), "set"))
+                props.append((mean[sol], tuple(int(i) for i in inv[idx]), tuple(int(x) for x in bal[idx]), "set"))
         if not props:
             continue
         props.sort(key=lambda x: (-x[0], len(x[1])))

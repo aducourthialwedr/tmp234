@@ -135,3 +135,13 @@ def test_proposals_record_each_rule_alone(frozen):
 def test_exact_subset(amounts, target, kwargs, status, indices):
     res = exact_subset(np.array(amounts), target, **kwargs)
     assert res.status == status and res.indices == indices
+
+
+def test_exact_subset_same_result_whatever_the_order():
+    # Le parcours est mémorisé sur les montants triés : un autre ordre d'entrée doit désigner les mêmes montants.
+    amounts = np.array([400, 100, 250, 50, 900])
+    first = exact_subset(amounts, 650)
+    perm = np.array([3, 0, 4, 1, 2])
+    second = exact_subset(amounts[perm], 650)
+    assert first.status == second.status == UNIQUE
+    assert sorted(amounts[list(first.indices)]) == sorted(amounts[perm][list(second.indices)]) == [250, 400]

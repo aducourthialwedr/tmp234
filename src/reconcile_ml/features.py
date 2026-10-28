@@ -245,7 +245,8 @@ class Featurizer:
         due_gap = np.where(fits, due_gap, np.inf)
 
         def rank_by(key: np.ndarray) -> np.ndarray:
-            order = np.lexsort((c["inv"].to_numpy(), key, row))
+            # `c` est trié par (row, inv) (`_or_sources`) : un tri stable sur (row, key) départage déjà par facture.
+            order = np.lexsort((key, row))
             r = np.empty(len(row), dtype=np.int64)
             starts = np.flatnonzero(np.r_[True, row[order][1:] != row[order][:-1]]) if len(row) else np.array([], int)
             r[order] = np.arange(len(row)) - np.repeat(starts, np.diff(np.r_[starts, len(row)]))
@@ -260,8 +261,9 @@ class Featurizer:
 
     @staticmethod
     def _or_sources(c: pd.DataFrame) -> pd.DataFrame:
-        c = c.sort_values(["row", "inv"], kind="mergesort")
-        row, inv, src = c["row"].to_numpy(), c["inv"].to_numpy(), c["src"].to_numpy(dtype=np.int64)
+        order = np.lexsort((c["inv"].to_numpy(), c["row"].to_numpy()))     # stable, comme un tri pandas mergesort
+        row, inv = c["row"].to_numpy()[order], c["inv"].to_numpy()[order]
+        src = c["src"].to_numpy(dtype=np.int64)[order]
         starts = np.flatnonzero(np.r_[True, (row[1:] != row[:-1]) | (inv[1:] != inv[:-1])])
         return pd.DataFrame({"row": row[starts], "inv": inv[starts], "src": np.bitwise_or.reduceat(src, starts)})
 

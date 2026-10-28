@@ -202,26 +202,36 @@ class RulesMatcher:
         owner, inv, balance = self.state.debtor_open_invoices_at(debtors, as_of)
         eff = self._effective(inv, balance)
         ok = eff > 0
-        by_debtor = pd.DataFrame({"debtor": debtors[owner[ok]], "inv": inv[ok], "balance": eff[ok]})
-        grouped = {d: (g["inv"].to_numpy(), g["balance"].to_numpy()) for d, g in by_debtor.groupby("debtor")}
+        owner, inv, eff = owner[ok], inv[ok], eff[ok]          # contigus par débiteur, dans l'ordre de `debtors`
+        first = np.searchsorted(owner, np.arange(len(debtors)), side="left")
+        last = np.searchsorted(owner, np.arange(len(debtors)), side="right")
         max_open = int(params.get("max_open_invoices", 30))
-        out = []
-        for row, group in scope.groupby("row"):
-            pools = [grouped[d] for d in group["debtor"] if d in grouped]
-            if not pools:
+        max_size, budget = int(params.get("max_invoices", 5)), int(params.get("node_budget", 100_000))
+        # Lignes du lot dans l'ordre, débiteurs de chaque ligne dans l'ordre de la portée.
+        order = np.argsort(scope["row"].to_numpy(), kind="stable")
+        rows_s = scope["row"].to_numpy()[order]
+        deb_s = np.searchsorted(debtors, scope["debtor"].to_numpy()[order])
+        bounds = np.r_[np.flatnonzero(np.r_[True, rows_s[1:] != rows_s[:-1]]), len(rows_s)]
+        out_row, out_inv, out_amt = [], [], []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            row = int(rows_s[a])
+            spans = [np.arange(first[k], last[k]) for k in deb_s[a:b] if last[k] > first[k]]
+            if not spans:
                 continue
-            invs = np.concatenate([p[0] for p in pools])
-            bals = np.concatenate([p[1] for p in pools])
-            fits = bals <= amount[row]
-            invs, bals = invs[fits], bals[fits]
-            if len(invs) == 0 or len(invs) > max_open:
+            idx = np.concatenate(spans)
+            idx = idx[eff[idx] <= amount[row]]
+            if len(idx) == 0 or len(idx) > max_open:
                 continue
-            res = exact_subset(bals, int(amount[row]), max_size=int(params.get("max_invoices", 5)),
-                               node_budget=int(params.get("node_budget", 100_000)))
+            res = exact_subset(eff[idx], int(amount[row]), max_size=max_size, node_budget=budget)
             if res.status == UNIQUE:
-                idx = list(res.indices)
-                out.append(pd.DataFrame({"row": row, "inv": invs[idx], "amount": bals[idx]}))
-        return pd.concat(out, ignore_index=True) if out else _no_proposal()
+                chosen = idx[list(res.indices)]
+                out_row.append(np.full(len(chosen), row, dtype=np.int64))
+                out_inv.append(inv[chosen])
+                out_amt.append(eff[chosen])
+        if not out_row:
+            return _no_proposal()
+        return pd.DataFrame({"row": np.concatenate(out_row), "inv": np.concatenate(out_inv),
+                             "amount": np.concatenate(out_amt)})
 
     # --- Journée ------------------------------------------------------------------------------------------
 
@@ -269,10 +279,14 @@ class RulesMatcher:
         if not chosen:
             return pd.DataFrame(columns=DECISION_COLUMNS)
         accepted = self._arbitrate(pd.concat(chosen, ignore_index=True), batch_ids, as_of)
-        for row, group in accepted.groupby("row"):
-            claims = list(zip(group["inv"].tolist(), group["amount"].tolist()))
-            self._claims.setdefault(int(pos[row]), []).extend(claims)
-            np.add.at(self._claimed, group["inv"].to_numpy(), group["amount"].to_numpy())
+        # Réservations par paiement (dans l'ordre des lignes, comme un groupby), sans itérer sur des groupes pandas.
+        rows_a, inv_a, amt_a = (accepted[c].to_numpy() for c in ("row", "inv", "amount"))
+        o = np.argsort(rows_a, kind="stable")
+        rows_s, inv_s, amt_s = rows_a[o], inv_a[o].tolist(), amt_a[o].tolist()
+        bounds = np.r_[np.flatnonzero(np.r_[True, rows_s[1:] != rows_s[:-1]]), len(rows_s)] if len(rows_s) else []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            self._claims.setdefault(int(pos[rows_s[a]]), []).extend(zip(inv_s[a:b], amt_s[a:b]))
+        np.add.at(self._claimed, inv_a.astype(np.int64), amt_a.astype(np.int64))
         return pd.DataFrame({
             "payment_id": batch_ids[accepted["row"].to_numpy()], "invoice_id": self._inv_ids[accepted["inv"].to_numpy()],
             "amount": pd.array(accepted["amount"].to_numpy(), dtype="Int64"), "action": AUTO, "step": "rules",

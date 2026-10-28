@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from src.arrow_ops import list_take
+from src.arrow_ops import lists_intersect, lists_source
 from src.load.events import EVENT_RANK, EventType
 from src.load.loader import LoadedData
 
@@ -92,6 +92,9 @@ class LedgerState:
         self.window_days = window_days
         self._inv = t["invoice"].reset_index(drop=True)
         self._pay = t["payment"].reset_index(drop=True)
+        # Listes lues chaque jour par les agrégats glissants : préparées une fois (voir `lists_source`).
+        self._pay_numbers = lists_source(self._pay["label_numbers"])
+        self._inv_keys = lists_source(self._inv["client_reference_keys"])
         self._agr = t["agreement"].reset_index(drop=True)
         self._parties = {r: t[r].reset_index(drop=True) for r in _ROLES}
         self._cf = t["client_file"].reset_index(drop=True) if "client_file" in t else None
@@ -246,10 +249,7 @@ class LedgerState:
         delay = (self._pay_value_day[pay] - self._inv_due_day[inv]).astype(np.float64)
         has_delay = np.abs(delay) < 1e6
         delay = np.where(has_delay, delay, 0.0)
-        pay_numbers = list_take(self._pay["label_numbers"], pay)
-        inv_keys = list_take(self._inv["client_reference_keys"], inv)
-        cited = np.fromiter((bool(set(n) & set(k)) for n, k in zip(pay_numbers, inv_keys)),
-                            dtype=bool, count=len(pay))
+        cited = lists_intersect(self._pay_numbers, pay, self._inv_keys, inv)
         values = np.zeros((len(lines), _N_WIN))
         values[:, _W_PAYMENTS] = first_of_pay
         values[:, _W_LINES] = 1

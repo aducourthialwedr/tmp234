@@ -26,3 +26,21 @@ def test_lookup_datetime_values():
     out = lookup(s(["x", "y"]), s(["x"]), pd.Series(pd.to_datetime(["2024-01-02"])))
     assert out.iloc[0] == pd.Timestamp("2024-01-02")
     assert pd.isna(out.iloc[1])
+
+
+def _lists(values):
+    import pyarrow as pa
+    return pd.Series(pd.arrays.ArrowExtensionArray(pa.chunked_array([pa.array(values[:2]), pa.array(values[2:])])))
+
+
+def test_lists_intersect_arrow_and_python_agree():
+    import numpy as np
+
+    from src.arrow_ops import lists_intersect, lists_source
+    numbers = [["12", "FA9"], None, ["7"], ["X1", "12"]]
+    keys = [["FA9"], ["12"], [], ["Y"]]
+    a_pos, b_pos = np.array([0, 1, 2, 3, 3, 0]), np.array([0, 1, 2, 3, 1, 1])
+    expected = [True, False, False, False, True, True]
+    arrow = lists_intersect(lists_source(_lists(numbers)), a_pos, lists_source(_lists(keys)), b_pos)
+    python = lists_intersect(pd.Series(numbers, dtype=object), a_pos, pd.Series(keys, dtype=object), b_pos)
+    assert arrow.tolist() == expected and python.tolist() == expected
