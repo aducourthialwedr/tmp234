@@ -398,10 +398,69 @@ class Project:
         return {"summary": summary, **tables}
 
     @_tracked
+    def analyze(self, period: str = "test", matcher: str = "pipeline") -> dict:
+        """Évaluation approfondie d'un rejeu : une ligne par paiement (issue, type d'erreur, raison du résiduel,
+        segments, diagnostic ML) dans `reports/analysis_<matcher>_<period>.parquet` (src/evaluation/analysis.py)."""
+        from src.evaluation import analysis
+        tag = f"replay_{matcher}_{period}"
+        context, decisions, truth, scope = self._replay_outputs(period, matcher)
+        base, replay_dir = self.interim_dir, self.interim_dir / "replay"
+        read = lambda name, cols=None: pd.read_parquet(base / f"{name}.parquet", columns=cols)  # noqa: E731
+        side = lambda name: (pd.read_parquet(replay_dir / f"{tag}_{name}.parquet")  # noqa: E731
+                             if (replay_dir / f"{tag}_{name}.parquet").exists() else None)
+        candidates = side("ml_candidates")
+        if candidates is not None:
+            candidates = candidates[["payment_id", "invoice_id", "p"]]
+        thresholds = None
+        if matcher == "pipeline" and (self.model_dir / "model.json").exists():
+            thresholds = json.loads((self.model_dir / "model.json").read_text(encoding="utf-8")).get("thresholds")
+        payment = read("payment")
+        payment = payment[[c for c in ("payment_id", "amount", "label", "channel", "payment_type", "bankroll_code",
+                                       "iban_debtor") if c in payment]]
+        payments = analysis.analyze_payments(
+            decisions, truth, scope, payment,
+            read("invoice", ["invoice_id", "debtor_id", "agreement_id", "client_reference"]),
+            read("agreement", ["agreement_id", "market", "product"]),
+            read("imputation", ["payment_id", "updated_at"]), candidates, side("payment_info"), thresholds)
+        out = self.reports_dir / f"analysis_{matcher}_{period}"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payments.to_parquet(out.with_suffix(".parquet"), index=False)
+        summary = analysis.summary(payments)
+        payload = {"context": {**context, "ml_candidates": candidates is not None,
+                               "payment_info": side("payment_info") is not None}, "summary": summary}
+        out.with_suffix(".json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+                                            encoding="utf-8")
+        self.log(f"  analyse : {len(payments)} paiements → {out.with_suffix('.parquet')}")
+        return {"summary": summary, "payments": payments}
+
+    @_tracked
     def backtest(self, period: str = "test", matcher: str = "pipeline") -> dict:
-        """Rejeu puis évaluation (étape 6)."""
+        """Rejeu, évaluation (étape 6) et évaluation approfondie."""
         self.replay(period, matcher)
-        return self.evaluate(period, matcher)
+        result = self.evaluate(period, matcher)
+        self.analyze(period, matcher)
+        return result
+
+    # --- Ingestion des sources réelles --------------------------------------------------------------------------
+
+    @_tracked
+    def validate_sources(self) -> dict:
+        """Contrôle des sources réelles avant chargement : chaque table de config/schema.yaml lue en entier,
+        convertie comme au chargement, puis les contrôles qualité. Rapports `reports/sources_validation_*`."""
+        from src.load.ingest import validate_sources
+        schema_cfg = read_yaml(self.schema_path)
+        base = resolve_path(schema_cfg.get("base_dir") or ".")
+        result = validate_sources(schema_cfg, base, log=self.log)
+        rep = self.reports_dir
+        rep.mkdir(parents=True, exist_ok=True)
+        for name in ("fields", "conversion", "quality", "volumes"):
+            result[name].to_csv(rep / f"sources_validation_{name}.csv", index=False)
+        summary = {"schema": str(self.schema_path), "base_dir": str(base), "bloquants": result["problems"],
+                   "anomalies_qualité": int(len(result["quality"])), "prêt_à_charger": not result["problems"],
+                   "date": time.strftime("%Y-%m-%d %H:%M:%S")}
+        (rep / "sources_validation.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False),
+                                                     encoding="utf-8")
+        return {"summary": summary, **{k: v for k, v in result.items() if k != "problems"}}
 
     def report(self, matcher: str = "pipeline", period: str = "test") -> dict:
         """Relit une évaluation déjà calculée (sans recalcul)."""
@@ -413,13 +472,30 @@ class Project:
 
 
 def run_task(task: str, kwargs: dict) -> None:
-    """Exécute une méthode de `Project` dans un processus séparé (utilisé par l'interface)."""
+    """Exécute une méthode de `Project` dans un processus séparé (utilisé par l'interface).
+
+    `_monitor` : suivi du temps et de la mémoire dans `<reports_dir>/memory.csv` (comme le notebook) ;
+    `_profile` : profil par fonction dans `<reports_dir>/profiles` (src/profiling.py)."""
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
+    monitored, profiled = kwargs.pop("_monitor", False), kwargs.pop("_profile", False)
     project_args = {k: kwargs.pop(k) for k in ("dataset", "settings_path", "schema_path", "rules_path") if k in kwargs}
-    project = Project(**project_args, log=lambda m: print(m, flush=True))
-    result = getattr(project, task)(**kwargs)
+    echo = lambda m: print(m, flush=True)  # noqa: E731
+    project = Project(**project_args, log=echo)
+    runtime = resolve_path(project.settings.paths.reports_dir)
+    monitor = memory.MemoryMonitor(runtime / "memory.csv", echo=echo).start() if monitored else None
+    if monitor is not None:
+        project.log = monitor.log
+    from src.profiling import Profiler
+    prof = Profiler(runtime / "profiles", enabled=profiled, log=echo)
+    name = " · ".join([task, project.dataset, *(str(v) for v in kwargs.values())])
+    try:
+        with prof(name):
+            result = getattr(project, task)(**kwargs)
+    finally:
+        if monitor is not None:
+            monitor.stop()
     summary = result.get("summary") if isinstance(result, dict) else None
     if summary is not None:
         print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))

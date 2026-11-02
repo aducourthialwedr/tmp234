@@ -4,7 +4,8 @@
 - Formulaires générés à partir des modèles de `src/settings.py` : l'UI et la
   pipeline lisent les mêmes paramètres, avec la même validation.
 - Exécution des étapes en sous-processus (même CLI qu'en ligne de commande),
-  journal affiché en direct.
+  journal affiché en direct ; suivi du temps et de la mémoire, profil par fonction à la demande.
+- Diagnostics de `src/diagnostics.py` mis en cache tant que le journal ne change pas.
 
 Chemins de config surchargeables par variables d'environnement
 (`RECON_SETTINGS`, `RECON_SCHEMA`, `RECON_RULES`) — utilisé par les tests pour ne
@@ -17,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import types
 import typing
 from dataclasses import dataclass
@@ -53,7 +55,10 @@ class Step:
 
 STEPS: dict[str, Step] = {s.key: s for s in [
     Step("config", "Configuration", ":material/settings:", DONE,
-         "Mapping des sources réelles (schema.yaml) et paramètres généraux."),
+         "Paramètres généraux, fichiers de configuration, environnement d'exécution."),
+    Step("ingestion", "Sources et ingestion", ":material/upload_file:", DONE,
+         "Fichiers sources réels : lecture, correspondance des colonnes contrôlée en direct, validation avant "
+         "chargement."),
     Step("load", "1 · Chargement", ":material/database:", DONE,
          "Chargement, normalisation, journal d'événements, contrôles qualité."),
     Step("split", "2 · Découpage temporel", ":material/date_range:", DONE,
@@ -66,6 +71,10 @@ STEPS: dict[str, Step] = {s.key: s for s in [
          "Candidats, scoring LightGBM en deux passes, ensembles, décision par seuils sur le résiduel de l'étape 4."),
     Step("evaluation", "6 · Évaluation", ":material/monitoring:", DONE,
          "Backtest, taux d'automatisation à précision fixée, cascade, découpages par étape, règle, mois, groupe."),
+    Step("analysis", "Évaluation approfondie", ":material/troubleshoot:", DONE,
+         "Erreurs, résiduel manuel expliqué, segments, comparaison règles / ML : une ligne par paiement."),
+    Step("runtime", "Temps de run", ":material/timer:", DONE,
+         "D'où vient le temps des étapes : profil par étape et sous-étape, mémoire, profil par fonction."),
 ]}
 
 
@@ -115,9 +124,47 @@ def reports_dir(settings: Settings | None = None, ds: str | None = None) -> Path
     return base / "synthetic" if (ds or dataset()) == SYNTHETIC else base
 
 
+def runtime_dir(settings: Settings | None = None) -> Path:
+    """Suivi mémoire (`memory.csv`) et profils (`profiles/`) : dossier commun au notebook et à l'interface."""
+    return resolve_path((settings or current_settings()).paths.reports_dir)
+
+
+def model_dir(settings: Settings | None = None, ds: str | None = None) -> Path:
+    from src.reconcile_ml.pipeline import MODEL_DIRNAME
+    base = resolve_path((settings or current_settings()).paths.models_dir)
+    return base / ("synthetic" if (ds or dataset()) == SYNTHETIC else "real") / MODEL_DIRNAME
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
 def load_meta(settings: Settings | None = None, ds: str | None = None) -> dict[str, Any] | None:
     path = interim_dir(settings, ds) / "journal_meta.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+PERIOD_LABELS = {"train": "Entraînement", "validation": "Validation", "test": "Test (backtest)",
+                 "all": "Tout l'historique"}
+MATCHER_LABELS = {"pipeline": "Règles + ML (étapes 4 et 5)", "rules": "Règles (étape 4)", "null": "Rapprocheur vide"}
+
+
+def pct(value: float | None, digits: int = 1) -> str:
+    return "—" if value is None or value != value else f"{value:.{digits}%}"
+
+
+def num(value: float | None) -> str:
+    return "—" if value is None or value != value else f"{int(value):,}".replace(",", "\u202f")
+
+
+def stale(context_sha: str | None, what: str = "Résultat") -> bool:
+    """Avertit si un résultat a été calculé sur un autre journal que le dernier chargement."""
+    meta = load_meta()
+    if meta and context_sha and context_sha != meta["journal_sha256"]:
+        st.warning(f"{what} calculé sur un autre journal que le dernier chargement : le relancer.",
+                   icon=":material/warning:")
+        return True
+    return False
 
 
 def require_loaded_data() -> dict[str, Any] | None:
@@ -179,6 +226,10 @@ def field_widget(model: BaseModel, name: str, key: str, disabled: bool = False) 
             return None
         default = value if value is not None else (info.default if info.default is not None else None)
         return _scalar_widget(annotation, "↳ valeur", default, wkey, help_, disabled)
+    if typing.get_origin(annotation) is typing.Literal:
+        options = list(typing.get_args(annotation))
+        return st.selectbox(label, options, index=options.index(value) if value in options else 0, key=wkey,
+                            help=help_, disabled=disabled)
     if typing.get_origin(annotation) is list:
         options = list(dict.fromkeys([*(info.default_factory() if info.default_factory else []), *value]))
         return st.multiselect(label, options=options, default=value, key=wkey, help=help_, disabled=disabled)
@@ -235,7 +286,9 @@ def run_task(task: str, label: str, **kwargs) -> tuple[int, list[str]]:
     """
     project = {"dataset": "synthetic" if dataset() == SYNTHETIC else "real", "settings_path": str(settings_path()),
                "schema_path": str(schema_path()), "rules_path": str(rules_path())}
-    payload = json.dumps({**project, **kwargs})
+    tracking = {"_monitor": st.session_state.get("ui.monitor", True),
+                "_profile": st.session_state.get("ui.profile", False)}
+    payload = json.dumps({**project, **tracking, **kwargs})
     code_line = "import json, sys; from src.api import run_task; run_task(sys.argv[1], json.loads(sys.argv[2]))"
     cmd = [sys.executable, "-c", code_line, task, payload]
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
@@ -244,6 +297,7 @@ def run_task(task: str, label: str, **kwargs) -> tuple[int, list[str]]:
         shown = ", ".join(f"{k}={v!r}" for k, v in kwargs.items())
         st.code(f"Project(dataset={project['dataset']!r}).{task}({shown})", language="python")
         log = st.empty()
+        start = time.perf_counter()
         proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env)
         assert proc.stdout is not None
@@ -251,7 +305,8 @@ def run_task(task: str, label: str, **kwargs) -> tuple[int, list[str]]:
             lines.append(line.rstrip())
             log.code("\n".join(lines[-30:]), language="text")
         code = proc.wait()
-        status.update(label=f"{label} — {'terminé' if code == 0 else f'échec (code {code})'}",
+        minutes = (time.perf_counter() - start) / 60
+        status.update(label=f"{label} — {'terminé' if code == 0 else f'échec (code {code})'} en {minutes:.1f} min",
                       state="complete" if code == 0 else "error", expanded=code != 0)
     return code, lines
 
@@ -272,3 +327,21 @@ def read_parquet(path: Path, columns: list[str] | None = None) -> pd.DataFrame:
 def read_report(name: str) -> pd.DataFrame | None:
     path = reports_dir() / name
     return pd.read_csv(path) if path.exists() else None
+
+
+@st.cache_data(show_spinner="Calcul du diagnostic…", max_entries=32)
+def _diagnostic(name: str, journal: str, key: Any, args: tuple, kwargs: dict) -> Any:
+    from src import diagnostics
+    return getattr(diagnostics, name)(*args, **kwargs)
+
+
+def diagnostic(name: str, *args, _key: Any = None, **kwargs) -> Any:
+    """`src.diagnostics.<name>(*args, **kwargs)`, recalculé seulement si le journal (ou `_key`) change."""
+    meta = load_meta()
+    return _diagnostic(name, meta["journal_sha256"] if meta else "", _key, args, kwargs)
+
+
+def data_split(settings: Settings | None = None):
+    """Périodes train / validation / test des données chargées (réglages enregistrés)."""
+    settings = settings or current_settings()
+    return diagnostic("data_split", interim_dir(settings), settings.split)

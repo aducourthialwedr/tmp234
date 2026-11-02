@@ -139,13 +139,11 @@ class PipelineMatcher(_ResidualMixin):
         self.thresholds = model.meta.get("thresholds") if not record_proposals else             {"tau_high": 2.0, "tau_low": 0.0, "min_margin": 0.0, "kinds": {}, "segments": {}}
         self._daily: list[pd.DataFrame] = []
         self._diag: list[pd.DataFrame] = []
-        self._info: list[pd.DataFrame] = []
         self._seen: set[str] = set()
 
     def process(self, ctx: DayContext) -> pd.DataFrame:
         rules_decisions = super().process(ctx)
         batch_ids, pos, alloc, cands, X = self._residual(ctx, rules_decisions)
-        self._record_info(ctx, alloc, batch_ids)
         if X is None or not len(X):
             return rules_decisions
         amount = self._pay_amount[pos]
@@ -256,12 +254,6 @@ class PipelineMatcher(_ResidualMixin):
 
     # --- Diagnostics pour l'évaluation -----------------------------------------------------------------------
 
-    def _record_info(self, ctx, alloc, batch_ids) -> None:
-        new = ctx.batch["is_new"].to_numpy()
-        self._info.append(pd.DataFrame({"payment_id": batch_ids[new],
-                                        "client_file_id": alloc.payments["client_file_id"].to_numpy()[new],
-                                        "allocation_status": alloc.payments["status"].to_numpy()[new]}))
-
     def _record_diag(self, scored: pd.DataFrame, batch_ids: np.ndarray) -> None:
         """Candidats et scores du premier passage en ML de chaque paiement."""
         s = scored.assign(payment_id=batch_ids[scored["row"].to_numpy()])
@@ -277,11 +269,9 @@ class PipelineMatcher(_ResidualMixin):
         return pd.concat(self._daily, ignore_index=True) if self._daily else pd.DataFrame()
 
     def side_outputs(self) -> dict[str, pd.DataFrame]:
-        out = {"proposals": self.proposals()}
+        out = super().side_outputs()
         if self._diag:
             out["ml_candidates"] = pd.concat(self._diag, ignore_index=True)
-        if self._info:
-            out["payment_info"] = pd.concat(self._info, ignore_index=True).drop_duplicates("payment_id")
         return out
 
 

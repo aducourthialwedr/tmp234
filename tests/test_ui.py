@@ -44,7 +44,8 @@ def app(name: str) -> AppTest:
     return at
 
 
-@pytest.mark.parametrize("name", ["home", "config", "load", "split", "allocation", "rules", "ml", "evaluation"])
+@pytest.mark.parametrize("name", ["home", "config", "ingestion", "load", "split", "allocation", "rules", "ml",
+                                  "evaluation", "analysis", "runtime"])
 def test_every_page_renders(env, name):
     app(name)
 
@@ -55,10 +56,37 @@ def test_navigation_app_renders(env):
     assert not at.exception
 
 
-def test_config_lists_missing_mappings(env):
-    at = app("config")
+def test_ingestion_lists_missing_mappings(env):
+    at = app("ingestion")
     # Les expanders avec icône sont exposés comme éléments « status » par AppTest.
-    assert any("point(s) à compléter" in e.label for e in at.status)
+    assert any("point(s) bloquant" in e.label for e in at.status)
+
+
+def test_ingestion_maps_validates_and_saves(env, tmp_path, monkeypatch):
+    from src.config import read_yaml
+    from src.load.schema_io import load_schema, save_schema
+
+    cfg = read_yaml(REPO_ROOT / "config" / "schema.synthetic.yaml")
+    cfg["base_dir"] = str(env / "synthetic" / "3000_seed42")
+    save_schema(cfg, tmp_path / "schema.yaml")
+    monkeypatch.setenv("RECON_SCHEMA", str(tmp_path / "schema.yaml"))
+    at = app("ingestion")
+    assert any("Mapping valide" in m.value for m in at.success)
+    assert any("Configuration complète" in m.value for m in at.success)
+
+    at.selectbox(key="ingest.payment.col.label").set_value(None).run()          # champ requis retiré
+    assert any("Mapping incomplet" in m.value for m in at.error)
+    at.selectbox(key="ingestion.table").set_value("debtor").run()               # la saisie de payment est gardée
+    assert at.session_state["ingest.payment.col.label"] is None
+    at.button(key="ingestion.save").click().run()
+    assert load_schema(tmp_path / "schema.yaml")["tables"]["payment"]["columns"]["label"] is None
+
+    at.selectbox(key="ingestion.table").set_value("payment").run()
+    at.selectbox(key="ingest.payment.col.label").set_value("label").run()
+    at.button(key="ingestion.save").click().run()
+    at.button(key="ingestion.validate").click().run()
+    assert not at.exception
+    assert any("Prêt à charger" in m.value for m in at.success)
 
 
 def test_split_preview_and_save(env):
@@ -124,7 +152,7 @@ def test_evaluation_page_runs_replay_and_evaluation(env):
     at.button(key="evaluation.run").click().run()
     assert not at.exception
     assert (Path(env) / "reports" / "synthetic" / "evaluation_null_test.json").exists()
-    assert any(m.label == "À précision cible" for m in at.metric)
+    assert any(m.label == "Taux d'automatisation effectif" for m in at.metric)
 
 
 def test_evaluation_page_with_decisions_shows_curve(env):
@@ -171,3 +199,84 @@ def test_rules_page_runs_baseline(env):
     assert not at.exception
     assert (Path(env) / "reports" / "synthetic" / "evaluation_rules_validation.json").exists()
     assert any(m.label == "Taux d'automatisation" for m in at.metric)
+
+
+def test_ml_oof_scheme_is_a_choice(env):
+    at = app("ml")
+    box = at.selectbox(key="reconcile_ml.training.oof_scheme")
+    assert box.options == ["walk_forward", "random_folds"]
+    box.set_value("random_folds")
+    at.button(key="reconcile_ml.save").click().run()
+    assert load_settings(env / "settings.yaml").reconcile_ml.training.oof_scheme == "random_folds"
+
+
+def test_config_shows_changed_settings_and_environment(env):
+    at = app("config")
+    assert any("Réglages modifiés" in m.value for m in at.markdown)
+    assert any(m.label == "CPU utilisables" for m in at.metric)
+
+
+def test_diagnostic_toggles_render(env):
+    for page, key in (("load", "load.volumetry"), ("split", "split.diagnostics"),
+                      ("allocation", "allocation.client_files")):
+        at = app(page)
+        at.toggle(key=key).set_value(True).run()
+        assert not at.exception, (page, at.exception)
+
+
+def test_tracked_task_feeds_runtime_page(env):
+    from src import profiling
+    from src.api import run_task
+
+    run_task("replay", {"settings_path": str(env / "settings.yaml"), "rules_path": str(env / "rules.yaml"),
+                        "period": "test", "matcher": "null", "_monitor": True, "_profile": True})
+    assert (env / "reports" / "memory.csv").exists()
+    runs = profiling.saved_runs(env / "reports" / "profiles")
+    assert runs["nom"].str.startswith("replay · synthetic · test").any()
+    assert app("runtime").selectbox(key="runtime.profile") is not None
+
+    # Session de suivi aux relevés explicites (un rejeu de cette taille peut durer moins d'un relevé).
+    import time
+
+    from src import memory
+    monitor = memory.MemoryMonitor(env / "reports" / "memory.csv", interval=60, echo=lambda _: None).start()
+    try:
+        memory.mark_step("replay")
+        memory.mark("règles · R2_REFERENCE_UNIQUE")
+        monitor.sample()
+        time.sleep(0.05)
+        memory.mark_step(memory.IDLE)
+        monitor.sample()
+    finally:
+        monitor.stop()
+    at = app("runtime")
+    assert any("Par sous-étape" in m.value for m in at.markdown)
+
+
+def test_home_lists_every_step(env):
+    at = app("home")
+    labels = " ".join(m.value for m in at.markdown)
+    assert all(step.title in labels for step in __import__("src.ui.common", fromlist=["STEPS"]).STEPS.values())
+
+
+def test_portable_ui_is_generated_from_src():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_single_ui", REPO_ROOT / "tools" / "build_single_ui.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    expected = (REPO_ROOT / "single" / "reconciliation_ui.py").read_text(encoding="utf-8")
+    assert builder.build() == expected, "single/reconciliation_ui.py périmé : lancer python tools/build_single_ui.py"
+
+
+def test_analysis_page_shows_errors_residual_segments(env):
+    project = Project(settings_path=env / "settings.yaml", rules_path=env / "rules.yaml", log=lambda m: None)
+    project.backtest("validation", "rules")
+    at = AppTest.from_file(str(VIEWS / "analysis.py"), default_timeout=120)
+    at.run()
+    at.selectbox(key="analysis.matcher").set_value("rules")
+    at.segmented_control(key="analysis.period").set_value("validation").run()
+    assert not at.exception
+    assert any(m.label == "Paiements du périmètre" for m in at.metric)
+    at.selectbox(key="analysis.cross").set_value("Canal").run()
+    assert not at.exception

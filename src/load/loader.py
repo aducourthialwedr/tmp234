@@ -187,6 +187,17 @@ def _load_table(
     issues: list[Issue],
 ) -> tuple[pd.DataFrame, list[str]]:
     raw = _read_source(base_dir / tcfg["source"], tcfg.get("read_options") or {})
+    return convert_table(table, raw, tcfg, schema_cfg, issues)
+
+
+def convert_table(
+    table: Table,
+    raw: pd.DataFrame,
+    tcfg: dict[str, Any],
+    schema_cfg: dict[str, Any],
+    issues: list[Issue],
+) -> tuple[pd.DataFrame, list[str]]:
+    """Colonnes réelles → modèle canonique (types, value_maps). Sert aussi à valider un échantillon."""
     columns: dict[str, str] = {k: v for k, v in (tcfg.get("columns") or {}).items() if v}
 
     missing_cols = sorted(v for v in columns.values() if v not in raw.columns)

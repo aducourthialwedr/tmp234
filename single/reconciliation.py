@@ -55,6 +55,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from scipy.stats import beta
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 from types import SimpleNamespace
@@ -931,6 +932,22 @@ def _session(df: pd.DataFrame, session: int | None) -> pd.DataFrame:
     return df[df["session"] == df["session"].unique()[session]]
 
 
+def sessions(path: str | Path = "reports/memory.csv") -> pd.DataFrame:
+    """Une ligne par démarrage du suivi : début, durée, étapes exécutées, pic de mémoire (le plus récent en dernier)."""
+    raw = pd.read_csv(path, dtype=str, keep_default_na=False)
+    starts = raw.loc[raw["step"] == _START, "time"].reset_index(drop=True)
+    df = read_history(path)
+    cols = ["session", "début", "minutes", "étapes", "pic_rss_gb"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    steps = df[~df["step"].isin(["", IDLE])].groupby("session")["step"].agg(lambda s: " · ".join(dict.fromkeys(s)))
+    out = df.groupby("session").agg(minutes=("elapsed_s", "max"), pic_rss_gb=("rss_gb", "max")).reset_index()
+    out["minutes"] = out["minutes"] / 60
+    out["début"] = out["session"].map(lambda k: starts.iloc[k - 1] if 0 < k <= len(starts) else "")
+    out["étapes"] = out["session"].map(steps).fillna("")
+    return out[cols]
+
+
 def by_phase(path: str | Path = "reports/memory.csv", session: int | None = -1) -> pd.DataFrame:
     """Pic de mémoire par (étape, sous-étape), dans l'ordre d'exécution, pour la dernière session
     (`session=None` : toutes). Mesure : mémoire anonyme du pod si disponible, sinon RSS du processus."""
@@ -1017,7 +1034,7 @@ def time_chart(path: str | Path = "reports/memory.csv", session: int | None = No
 memory = SimpleNamespace(**{n: globals()[n] for n in (
     'MemoryMonitor', 'by_phase', 'chart', 'end_day', 'mark', 'mark_day', 'mark_step',
     'pod_memory', 'process_rss', 'read_history', 'release_memory', 'available_cpus',
-    'time_profile', 'time_chart', 'IDLE')})
+    'time_profile', 'time_chart', 'IDLE', 'sessions')})
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1241,6 +1258,8 @@ Deux moteurs, même sortie : des piles « repliées » (`f1;f2;f3 n`), lisibles 
   (10 par défaut), soit environ 0,1 ms de travail par relevé ; impact inférieur à 1 %.
 
 Une fonction est rangée par sa ligne de définition, pas par la ligne en cours : ses relevés se cumulent.
+Chaque mesure écrit aussi `<nom>.json` (durée, moteur) : `saved_runs(folder)` et `saved_summary(run)` relisent
+les profils d'une session précédente (page « Temps de run » de l'interface).
 """
 
 
@@ -1367,17 +1386,38 @@ class Profiler:
             sampler.stop(output)
             self.runs[name] = {"fichier": output, "secondes": time.perf_counter() - start, "moteur": engine,
                                "rate": self.rate}
+            meta = {**self.runs[name], "nom": name, "fichier": output.name, "fin": time.strftime("%Y-%m-%d %H:%M:%S")}
+            output.with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             self.log(f"  profil « {name} » : {self.runs[name]['secondes']:.0f} s, {engine} → {output}")
 
     def summary(self, name: str | None = None, top: int = 25) -> pd.DataFrame:
         """Tableau du profil `name` (le dernier si absent) : voir `stack_summary`."""
         if not self.runs:
             raise ValueError("aucun profil : activer le profileur (enabled=True) puis relancer l'étape")
-        run = self.runs[name] if name else list(self.runs.values())[-1]
-        # Le fil interne peut relever moins souvent que prévu (GIL, horloge) : ses durées sont calées sur le temps
-        # écoulé. py-spy respecte sa fréquence et n'enregistre pas l'inactivité : ses relevés valent 1 / rate.
-        seconds = run["secondes"] if run["moteur"] == "fil interne" else None
-        return stack_summary(run["fichier"], rate=run["rate"], top=top, seconds=seconds)
+        return _run_summary(self.runs[name] if name else list(self.runs.values())[-1], top)
+
+
+def _run_summary(run: dict, top: int) -> pd.DataFrame:
+    # Le fil interne peut relever moins souvent que prévu (GIL, horloge) : ses durées sont calées sur le temps
+    # écoulé. py-spy respecte sa fréquence et n'enregistre pas l'inactivité : ses relevés valent 1 / rate.
+    seconds = run["secondes"] if run["moteur"] == "fil interne" else None
+    return stack_summary(run["fichier"], rate=run["rate"], top=top, seconds=seconds)
+
+
+def saved_runs(folder: str | Path = "reports/profiles") -> pd.DataFrame:
+    """Profils enregistrés dans le dossier (notebook ou interface), du plus récent au plus ancien."""
+    rows = []
+    for meta_path in Path(folder).glob("*.json"):
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if (meta_path.parent / meta["fichier"]).exists():
+            rows.append({**meta, "fichier": str(meta_path.parent / meta["fichier"])})
+    out = pd.DataFrame(rows, columns=["nom", "fin", "secondes", "moteur", "rate", "fichier"])
+    return out.sort_values("fin", ascending=False, ignore_index=True)
+
+
+def saved_summary(run: dict, top: int = 25) -> pd.DataFrame:
+    """Tableau d'un profil enregistré (une ligne de `saved_runs`)."""
+    return _run_summary(run, top)
 
 
 def _parse(path: Path) -> list[tuple[list[str], int]]:
@@ -1437,7 +1477,7 @@ def stack_summary(path: str | Path, rate: float = 10, top: int = 25, seconds: fl
 
 
 profiling = SimpleNamespace(**{n: globals()[n] for n in (
-    'Profiler', 'stack_summary', 'find_pyspy')})
+    'Profiler', 'stack_summary', 'find_pyspy', 'saved_runs', 'saved_summary')})
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -2017,6 +2057,17 @@ def _load_table(
     issues: list[Issue],
 ) -> tuple[pd.DataFrame, list[str]]:
     raw = _read_source(base_dir / tcfg["source"], tcfg.get("read_options") or {})
+    return convert_table(table, raw, tcfg, schema_cfg, issues)
+
+
+def convert_table(
+    table: Table,
+    raw: pd.DataFrame,
+    tcfg: dict[str, Any],
+    schema_cfg: dict[str, Any],
+    issues: list[Issue],
+) -> tuple[pd.DataFrame, list[str]]:
+    """Colonnes réelles → modèle canonique (types, value_maps). Sert aussi à valider un échantillon."""
     columns: dict[str, str] = {k: v for k, v in (tcfg.get("columns") or {}).items() if v}
 
     missing_cols = sorted(v for v in columns.values() if v not in raw.columns)
@@ -2740,6 +2791,268 @@ def load_schema(path: str | Path = DEFAULT_SCHEMA_PATH) -> dict[str, Any]:
 
 def save_schema(cfg: dict[str, Any], path: str | Path = DEFAULT_SCHEMA_PATH) -> None:
     Path(path).write_text(dump_schema(cfg), encoding="utf-8")
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# src/load/ingest.py
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+"""Ingestion assistée des sources réelles : lecture d'un fichier, profil des colonnes, contrôle du mapping.
+
+Sert la page « Sources et ingestion » de l'interface. Rien n'est deviné : chaque colonne est choisie par
+l'utilisateur ; ce module lit, montre et contrôle avec les convertisseurs du chargement (`convert_table`),
+de sorte qu'un champ validé ici se charge à l'identique.
+
+- `source_path` : chemin du fichier (absolu, ou relatif au répertoire des sources) ;
+- `read_sample` : premières lignes, en texte comme au chargement ; `count_rows` : lignes du fichier ;
+- `sniff_csv` : séparateur et encodage proposés, à confirmer ;
+- `profile_columns` : remplissage, valeurs distinctes, exemples ;
+- `check_fields` : par champ canonique, conversion d'un échantillon et statut ;
+- `validate_sources` : fichiers complets, conversion de toutes les tables, contrôles qualité du chargement.
+"""
+
+
+
+
+
+SAMPLE_ROWS = 20_000
+SUPPORTED = (".csv", ".txt", ".tsv", ".parquet")
+OK, INFO, WARNING, ERROR = "ok", "info", "attention", "erreur"
+
+
+def source_path(base_dir: str | Path, source: str | None) -> Path | None:
+    """Chemin du fichier source : absolu tel quel, sinon relatif au répertoire des sources."""
+    return Path(base_dir) / source if source else None
+
+
+def list_sources(base_dir: str | Path, limit: int = 500, depth: int = 3) -> list[str]:
+    """Fichiers CSV / Parquet du répertoire des sources, sous-dossiers compris (jusqu'à `depth` niveaux, dossiers
+    cachés exclus), chemins relatifs. Les entrées illisibles sont ignorées."""
+    import os
+    base = Path(base_dir)
+    if not base.is_dir():
+        return []
+    found: list[str] = []
+    for root, dirs, files in os.walk(base, onerror=lambda _: None):
+        level = len(Path(root).relative_to(base).parts)
+        dirs[:] = [] if level >= depth else sorted(d for d in dirs if not d.startswith((".", "__")))
+        found += [str((Path(root) / f).relative_to(base)).replace("\\", "/") for f in sorted(files)
+                  if Path(f).suffix.lower() in SUPPORTED]
+        if len(found) >= limit:
+            break
+    return sorted(found)[:limit]
+
+
+def sniff_csv(path: str | Path, size: int = 65_536) -> dict[str, Any]:
+    """Options de lecture proposées pour un CSV (séparateur, encodage), à vérifier sur l'aperçu."""
+    head = Path(path).open("rb").read(size)
+    options: dict[str, Any] = {}
+    if head.startswith(b"\xef\xbb\xbf"):
+        options["encoding"] = "utf-8-sig"
+        text = head[3:].decode("utf-8", errors="ignore")
+    else:
+        try:
+            text = head.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if exc.start < len(head) - 4:           # pas seulement un caractère coupé en fin de bloc
+                options["encoding"] = "latin-1"
+                text = head.decode("latin-1")
+            else:
+                text = head[:exc.start].decode("utf-8")
+    lines = text.splitlines()[:50]
+    try:
+        sep = csv.Sniffer().sniff("\n".join(lines), delimiters=";,\t|").delimiter
+    except csv.Error:
+        sep = ","
+    if sep != ",":
+        options["sep"] = sep
+    return options
+
+
+def read_sample(path: str | Path, read_options: dict[str, Any] | None = None, rows: int = SAMPLE_ROWS) -> pd.DataFrame:
+    """Premières lignes du fichier, lues comme au chargement (texte pour les CSV, types natifs pour Parquet)."""
+    path = Path(path)
+    if path.suffix.lower() == ".parquet":
+        import pyarrow.parquet as pq
+        batch = next(pq.ParquetFile(path).iter_batches(batch_size=rows), None)
+        return batch.to_pandas() if batch is not None else pd.read_parquet(path)
+    opts = {"dtype": str, "keep_default_na": False, "na_values": [""], **(read_options or {})}
+    return pd.read_csv(path, nrows=rows, **opts)
+
+
+def count_rows(path: str | Path) -> int:
+    """Lignes de données (Parquet : métadonnées ; CSV : sauts de ligne, en-tête exclu)."""
+    path = Path(path)
+    if path.suffix.lower() == ".parquet":
+        import pyarrow.parquet as pq
+        return pq.ParquetFile(path).metadata.num_rows
+    n, last = 0, b"\n"
+    with path.open("rb") as fh:
+        while chunk := fh.read(1 << 24):
+            n += chunk.count(b"\n")
+            last = chunk[-1:]
+    return n - 1 + (last != b"\n")
+
+
+def _filled(s: pd.Series) -> pd.Series:
+    if s.dtype == object or pd.api.types.is_string_dtype(s):
+        return s.notna() & (s.astype("string").str.strip() != "")
+    return s.notna()
+
+
+def profile_columns(sample: pd.DataFrame) -> pd.DataFrame:
+    """Une ligne par colonne du fichier : type lu, remplissage, valeurs distinctes, exemples."""
+    rows = []
+    for col in sample.columns:
+        s = sample[col]
+        filled = _filled(s)
+        values = s[filled].astype("string").unique()[:4]
+        rows.append({"colonne": col, "type lu": str(s.dtype), "remplie": float(filled.mean()) if len(s) else 0.0,
+                     "distinctes": int(s[filled].nunique()), "exemples": " · ".join(map(str, values))})
+    return pd.DataFrame(rows, columns=["colonne", "type lu", "remplie", "distinctes", "exemples"])
+
+
+def _overview(ftype: FieldType, conv: pd.Series) -> str:
+    v = conv.dropna()
+    if not len(v):
+        return ""
+    if ftype in (FieldType.DATE, FieldType.TIMESTAMP):
+        fmt = "%d/%m/%Y" if ftype is FieldType.DATE else "%d/%m/%Y %H:%M"
+        return f"{v.min():{fmt}} → {v.max():{fmt}}"
+    if ftype is FieldType.AMOUNT:
+        neg = int((v < 0).sum())
+        return f"{v.min() / 100:,.2f} → {v.max() / 100:,.2f} €".replace(",", " ") + (f" · {neg} négatifs" if neg else "")
+    distinct = v.nunique()
+    return f"{distinct} distinctes · " + " · ".join(map(str, v.unique()[:3]))
+
+
+def _convert(table_name: str, raw: pd.DataFrame, tcfg: dict[str, Any], schema_cfg: dict[str, Any],
+             issues: list[Issue]) -> tuple[pd.DataFrame, list[str]]:
+    """`convert_table` sur les seules colonnes présentes ; montants lus en centimes tant que l'unité manque."""
+    present = {k: v for k, v in (tcfg.get("columns") or {}).items() if v and v in raw.columns}
+    return convert_table(TABLES[table_name], raw, {**tcfg, "columns": present},
+                         {**schema_cfg, "amount_unit": schema_cfg.get("amount_unit") or "cents"}, issues)
+
+
+def check_fields(table_name: str, sample: pd.DataFrame, tcfg: dict[str, Any], schema_cfg: dict[str, Any],
+                 converted: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Contrôle du mapping d'une table sur un échantillon : chaque champ canonique converti comme au chargement.
+
+    Statuts : ok, info (optionnel non mappé, doublons de parties consolidés au chargement), attention (valeurs
+    invalides, colonne vide, valeurs à traduire), erreur (champ requis non mappé, colonne absente du fichier,
+    unité des montants non renseignée, identifiant en double). `converted` : conversion déjà faite."""
+    table = TABLES[table_name]
+    columns = {k: v for k, v in (tcfg.get("columns") or {}).items() if v}
+    units_ok = schema_cfg.get("amount_unit") in ("cents", "units")
+    if converted is None:
+        converted, _ = _convert(table_name, sample, tcfg, schema_cfg, [])
+    rows = []
+    for f in table.fields:
+        col = columns.get(f.name)
+        row = {"champ": f.name, "type": f.type.value, "requis": f.required, "colonne": col or "",
+               "remplis": None, "convertis": None, "invalides": 0, "exemples invalides": "", "aperçu": "",
+               "statut": OK, "détail": ""}
+        if not col:
+            row["statut"], row["détail"] = (ERROR, "champ requis à mapper") if f.required else (INFO, "non mappé")
+            rows.append(row)
+            continue
+        if col not in sample.columns:
+            row["statut"], row["détail"] = ERROR, "colonne absente du fichier"
+            rows.append(row)
+            continue
+        raw, conv = sample[col].reset_index(drop=True), converted[f.name]
+        filled = _filled(raw)
+        bad = filled & conv.isna()
+        n_filled = int(filled.sum())
+        row.update(remplis=float(filled.mean()) if len(raw) else 0.0, invalides=int(bad.sum()),
+                   convertis=float(1 - bad.sum() / n_filled) if n_filled else None,
+                   aperçu=_overview(f.type, conv))
+        if bad.any():
+            row["exemples invalides"] = " · ".join(map(str, raw[bad].astype("string").unique()[:5]))
+        if f.type is FieldType.AMOUNT and not units_ok:
+            row["statut"], row["détail"] = ERROR, "unité des montants (amount_unit) à renseigner"
+        elif n_filled == 0:
+            row["statut"], row["détail"] = (WARNING if f.required else INFO), "colonne mappée, toujours vide"
+        elif bad.any():
+            row["statut"], row["détail"] = WARNING, f"{int(bad.sum())} valeurs non convertibles (mises à vide)"
+        if table_name == "imputation" and f.name == "status":
+            unknown = conv.notna() & ~conv.isin(IMPUTATION_STATUSES)
+            if unknown.any():
+                row["statut"] = WARNING
+                row["détail"] = ("valeurs à traduire en FULL / PARTIAL (value_maps) : "
+                                 + ", ".join(map(str, conv[unknown].unique()[:8])))
+        if f.name in table.primary_key and len(table.primary_key) == 1 and n_filled:
+            dup = int(conv.dropna().duplicated().sum())
+            if dup:
+                party = table_name in ("assignor", "debtor")
+                row["statut"] = INFO if party and row["statut"] == OK else (row["statut"] if party else ERROR)
+                row["détail"] = (f"{dup} identifiants répétés : lignes regroupées par partie au chargement" if party
+                                 else f"{dup} identifiants en double sur l'échantillon")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def table_status(fields: pd.DataFrame) -> str:
+    for status in (ERROR, WARNING):
+        if (fields["statut"] == status).any():
+            return status
+    return OK
+
+
+# --- Validation complète ------------------------------------------------------------------------------------
+
+def validate_sources(schema_cfg: dict[str, Any], base_dir: str | Path, log=print) -> dict[str, Any]:
+    """Toutes les tables configurées, lues en entier et converties comme au chargement, puis les contrôles qualité
+    du chargement (clés, intégrité référentielle, cohérence des imputations). Sans normalisation ni journal."""
+
+    base = Path(base_dir)
+    problems = _check_config(schema_cfg, base)
+    tables: dict[str, pd.DataFrame] = {}
+    mapped: dict[str, list[str]] = {}
+    issues: list[Issue] = []
+    fields, volumes = [], []
+    for name, table in TABLES.items():
+        tcfg = (schema_cfg.get("tables") or {}).get(name) or {}
+        if not tcfg.get("source") or not (base / tcfg["source"]).exists():
+            continue
+        log(f"  {name} : lecture de {tcfg['source']}")
+        raw = _read_source(base / tcfg["source"], tcfg.get("read_options") or {})
+        missing = sorted(v for v in (tcfg.get("columns") or {}).values() if v and v not in raw.columns)
+        if missing:
+            problems.append(f"tables.{name} : colonnes absentes du fichier {missing}")
+            continue
+        out, mapped[name] = _convert(name, raw, tcfg, schema_cfg, issues)
+        fields.append(check_fields(name, raw, tcfg, schema_cfg, converted=out).assign(table=name))
+        tables[name] = out
+        volumes.append({"table": name, "lignes": len(raw), "colonnes du fichier": raw.shape[1],
+                        "champs mappés": len(mapped[name])})
+        del raw
+    quality: list[Issue] = []
+    required = [n for n, t in TABLES.items() if t.required]
+    if all(n in tables for n in required):
+        log("  contrôles qualité")
+        inv = tables["invoice"]
+        audit = {"invoice_current_amount": inv[["invoice_id", "current_amount"]].copy()} \
+            if "current_amount" in mapped["invoice"] else {}
+        tables["invoice"] = inv.drop(columns=["current_amount"])
+        data = LoadedData(tables=tables, mapped_fields=mapped, issues=issues, audit=audit)
+        derived = derive_imputed_amounts(tables["imputation"], tables["invoice"])
+        quality = [i for i in check_quality(data, derived)
+                   if not (i.table in ("assignor", "debtor") and i.kind == "cle_dupliquee")]
+    else:
+        problems.append("contrôles qualité non faits : tables requises manquantes ou illisibles "
+                        f"({', '.join(n for n in required if n not in tables)})")
+    issue_cols = ["table", "champ", "contrôle", "lignes", "détail"]
+    as_rows = lambda found: pd.DataFrame([{"table": i.table, "champ": i.field, "contrôle": i.kind,  # noqa: E731
+                                           "lignes": i.count, "détail": i.detail} for i in found], columns=issue_cols)
+    field_table = pd.concat(fields, ignore_index=True) if fields else pd.DataFrame()
+    if len(field_table):
+        field_table = field_table[["table", *[c for c in field_table.columns if c != "table"]]]
+    blocking = list(problems)
+    if len(field_table):
+        blocking += [f"{r.table}.{r.champ} : {r.détail}" for r in field_table.itertuples() if r.statut == ERROR]
+    return {"problems": blocking, "fields": field_table, "conversion": as_rows(issues), "quality": as_rows(quality),
+            "volumes": pd.DataFrame(volumes, columns=["table", "lignes", "colonnes du fichier", "champs mappés"])}
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -4665,11 +4978,14 @@ def ml_diagnostics(candidates: pd.DataFrame, truth: pd.DataFrame, scope: pd.Data
     calib = c.assign(bin=b).groupby("bin").agg(paires=("label", "size"), score_moyen=("p", "mean"),
                                                taux_observé=("label", "mean")).reset_index()
     calib["tranche"] = [f"{edges[i]:.1f}–{edges[i + 1]:.1f}" for i in calib["bin"]]
+    found = first.dropna()                     # paiements dont une vraie facture est candidate (périmètre de la validation)
     return {
         "paiements_en_ml": int(len(got)),
         "rappel_candidats": float(recall),
         "precision_at_1": float((first == 1).mean()),
         "mrr": float((1.0 / first).fillna(0).mean()),
+        "precision_at_1_avec_positif": float((found == 1).mean()) if len(found) else None,
+        "mrr_avec_positif": float((1.0 / found).mean()) if len(found) else None,
     }, calib[["tranche", "paires", "score_moyen", "taux_observé"]]
 
 
@@ -5041,6 +5357,7 @@ class RulesMatcher:
         self._claims: dict[int, list[tuple[int, int]]] = {}         # paiement → [(facture, montant)]
         self._proposed: set[tuple[str, int]] = set()
         self._proposals: list[pd.DataFrame] = []
+        self._info: list[pd.DataFrame] = []
         self.last_allocation = None
 
     # --- Registre des réservations ------------------------------------------------------------------
@@ -5211,6 +5528,7 @@ class RulesMatcher:
         amount = self._pay_amount[pos]
         alloc = self.allocator.allocate(ctx)
         self.last_allocation = alloc
+        self._record_info(ctx, alloc, batch_ids)
         scopes = self._scopes(alloc, batch_ids)
 
         by_rule: dict[str, pd.DataFrame] = {}
@@ -5313,6 +5631,28 @@ class RulesMatcher:
         if not self._proposals:
             return pd.DataFrame(columns=["payment_id", "rule_id", "invoices", "day"])
         return pd.concat(self._proposals, ignore_index=True)
+
+    # --- Diagnostics pour l'évaluation (sans effet sur les décisions) ------------------------------------------
+
+    def _record_info(self, ctx, alloc, batch_ids) -> None:
+        """Allocation de chaque paiement le jour de son arrivée : client file, statut, route IBAN, débiteurs."""
+        new = ctx.batch["is_new"].to_numpy()
+        ids = batch_ids[new]
+        cand = alloc.candidates
+        cand = cand[cand["payment_id"].isin(ids)].sort_values(["payment_id", "rank"], kind="mergesort")
+        debtors = cand.groupby("payment_id", sort=False)["debtor_id"].agg(list)
+        payments = alloc.payments
+        self._info.append(pd.DataFrame({
+            "payment_id": ids, "client_file_id": payments["client_file_id"].to_numpy()[new],
+            "allocation_status": payments["status"].to_numpy()[new],
+            "iban_route": payments["iban_route"].to_numpy()[new],
+            "allocation_debtors": [debtors.get(i, []) for i in ids]}))
+
+    def side_outputs(self) -> dict[str, pd.DataFrame]:
+        out = {"proposals": self.proposals()}
+        if self._info:
+            out["payment_info"] = pd.concat(self._info, ignore_index=True).drop_duplicates("payment_id")
+        return out
 
 
 def rule_alone_metrics(proposals: pd.DataFrame, truth: pd.DataFrame, scope: pd.DataFrame,
@@ -6310,13 +6650,11 @@ class PipelineMatcher(_ResidualMixin):
         self.thresholds = model.meta.get("thresholds") if not record_proposals else             {"tau_high": 2.0, "tau_low": 0.0, "min_margin": 0.0, "kinds": {}, "segments": {}}
         self._daily: list[pd.DataFrame] = []
         self._diag: list[pd.DataFrame] = []
-        self._info: list[pd.DataFrame] = []
         self._seen: set[str] = set()
 
     def process(self, ctx: DayContext) -> pd.DataFrame:
         rules_decisions = super().process(ctx)
         batch_ids, pos, alloc, cands, X = self._residual(ctx, rules_decisions)
-        self._record_info(ctx, alloc, batch_ids)
         if X is None or not len(X):
             return rules_decisions
         amount = self._pay_amount[pos]
@@ -6427,12 +6765,6 @@ class PipelineMatcher(_ResidualMixin):
 
     # --- Diagnostics pour l'évaluation -----------------------------------------------------------------------
 
-    def _record_info(self, ctx, alloc, batch_ids) -> None:
-        new = ctx.batch["is_new"].to_numpy()
-        self._info.append(pd.DataFrame({"payment_id": batch_ids[new],
-                                        "client_file_id": alloc.payments["client_file_id"].to_numpy()[new],
-                                        "allocation_status": alloc.payments["status"].to_numpy()[new]}))
-
     def _record_diag(self, scored: pd.DataFrame, batch_ids: np.ndarray) -> None:
         """Candidats et scores du premier passage en ML de chaque paiement."""
         s = scored.assign(payment_id=batch_ids[scored["row"].to_numpy()])
@@ -6448,11 +6780,9 @@ class PipelineMatcher(_ResidualMixin):
         return pd.concat(self._daily, ignore_index=True) if self._daily else pd.DataFrame()
 
     def side_outputs(self) -> dict[str, pd.DataFrame]:
-        out = {"proposals": self.proposals()}
+        out = super().side_outputs()
         if self._diag:
             out["ml_candidates"] = pd.concat(self._diag, ignore_index=True)
-        if self._info:
-            out["payment_info"] = pd.concat(self._info, ignore_index=True).drop_duplicates("payment_id")
         return out
 
 
@@ -6665,6 +6995,625 @@ def recalibrate_ml(interim_dir: Path, model_dir: Path, settings: Settings, rules
     model.meta.setdefault("timings_s", {})["recalibration"] = round(time.perf_counter() - t, 1)
     model.save(model_dir)
     return model.meta
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# src/diagnostics.py
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+"""Diagnostics des données et des résultats pour l'interface, repris des outils `tools/diag_*.py` du notebook.
+
+Chaque fonction lit les sorties de l'étape 1 (`data/interim/...`) ou un export de décisions, colonne par colonne,
+et renvoie des tableaux prêts à afficher. Rien n'est écrit. Les volumes réels (millions de lignes) restent
+supportables : seules les colonnes utiles sont lues.
+
+- `open_invoice_stock` : stock de factures ouvertes mois par mois (une facture jamais imputée reste ouverte) ;
+- `pending_batches` : taille du lot quotidien (paiements du jour + reliquat) ;
+- `imputation_delays` : délai arrivée → imputation, comparé à la purge et à la rétention (fuite F3) ;
+- `client_file_conditions` : à quelle condition le rattachement d'un client file échoue ;
+- `iban_worst_case` : pire cas de la fuite F2 (IBAN connus avant le paiement qui les a révélés) ;
+- `clopper_pearson_lower`, `with_precision_bounds` : borne basse de la précision des auto-validations ;
+- `threshold_curve` : volume et précision des auto-validations ML selon τ_high, sur la boucle de validation ;
+- `importance_by_family` : gain LightGBM par famille de features.
+"""
+
+
+
+
+
+DAY = np.timedelta64(1, "D")
+
+
+def _utc(values) -> pd.Series:
+    return pd.to_datetime(values, utc=True).dt.tz_localize(None)
+
+
+def _read(interim: Path, table: str, columns: list[str], filters=None) -> pd.DataFrame:
+    import pyarrow.parquet as pq
+    path = Path(interim) / f"{table}.parquet"
+    present = set(pq.read_schema(path).names)
+    return pd.read_parquet(path, columns=[c for c in columns if c in present], filters=filters)
+
+
+def arrivals(interim: Path) -> pd.DataFrame:
+    """payment_id et jour d'arrivée (booking_date, sinon value_date), comme le journal."""
+    pay = _read(interim, "payment", ["payment_id", "value_date", "booking_date"])
+    day = pay["booking_date"].fillna(pay["value_date"]) if "booking_date" in pay else pay["value_date"]
+    return pd.DataFrame({"payment_id": pay["payment_id"], "day": _utc(day).dt.normalize()})
+
+
+def data_split(interim: Path, split_settings) -> Split:
+    """Découpage temporel sur la plage des paiements chargés (comme `Project.split`)."""
+    days = arrivals(interim)["day"]
+    return compute_split(split_settings, days.min().date(), days.max().date())
+
+
+def _imputations(interim: Path) -> pd.DataFrame:
+    """Lignes d'imputation datées avec leur montant imputé (tel que le journal les applique)."""
+    j = _read(interim, "journal", ["ts", "event_type", "entity_id", "related_id", "amount"],
+              filters=[("event_type", "==", "IMPUTATION_APPLIED")])
+    return pd.DataFrame({"payment_id": j["entity_id"], "invoice_id": j["related_id"], "ts": _utc(j["ts"]),
+                         "amount": j["amount"].astype("float64")})
+
+
+# --- Volumétrie : ce qui grossit avec la longueur de l'historique ---------------------------------------------
+
+def open_invoice_stock(interim: Path, split: Split) -> dict[str, pd.DataFrame]:
+    """Stock de factures ouvertes en début de mois, et âge du stock au début du test.
+
+    Le restant dû n'est reconstruit que par les imputations : une facture jamais (totalement) imputée reste
+    ouverte pour toujours et alourdit chaque jour de replay (règle R3, allocation par montant, candidats ML)."""
+    inv = _read(interim, "invoice", ["invoice_id", "creation_date", "due_date", "initial_amount", "debtor_id"])
+    inv["creation_date"], inv["due_date"] = _utc(inv["creation_date"]), _utc(inv["due_date"])
+    imp = _imputations(interim).merge(inv[["invoice_id", "initial_amount"]], on="invoice_id")
+    imp = imp.sort_values(["invoice_id", "ts"], kind="mergesort")
+    imp["cum"] = imp.groupby("invoice_id")["amount"].cumsum()
+    closed_at = imp[imp["cum"] >= imp["initial_amount"]].groupby("invoice_id")["ts"].min()
+    inv["closed_at"] = inv["invoice_id"].map(closed_at)
+    inv["ever_imputed"] = inv["invoice_id"].map(imp.groupby("invoice_id")["ts"].min()).notna()
+
+    months = pd.date_range(inv["creation_date"].min().normalize(), pd.Timestamp(split.periods[-1].end), freq="MS")
+    created = np.sort(inv["creation_date"].to_numpy())
+    closed = np.sort(inv["closed_at"].dropna().to_numpy())
+    curve = pd.DataFrame({"mois": months, "créées": np.searchsorted(created, months.to_numpy(), side="left"),
+                          "soldées": np.searchsorted(closed, months.to_numpy(), side="left")})
+    curve["ouvertes"] = curve["créées"] - curve["soldées"]
+
+    t0 = pd.Timestamp(split.period("test").start)
+    stock = inv[(inv["creation_date"] < t0) & ~(inv["closed_at"] < t0)]
+    late = (t0 - stock["due_date"]).dt.days
+    labels = ["pas encore échue", "0–90 j de retard", "90–180 j", "180–365 j", "1–2 ans", "> 2 ans"]
+    bucket = pd.cut(late, [-10**7, 0, 90, 180, 365, 730, 10**7], labels=labels)
+    age = pd.DataFrame({"factures": bucket.value_counts().reindex(labels).fillna(0).astype(int)})
+    age["part"] = age["factures"] / max(len(stock), 1)
+    age["jamais imputées"] = stock.groupby(bucket, observed=False)["ever_imputed"].apply(lambda s: int((~s).sum())) \
+        .reindex(labels).fillna(0).astype(int)
+    per_debtor = stock.groupby("debtor_id").size()
+    debtors = pd.Series({"débiteurs avec factures ouvertes": len(per_debtor),
+                         "factures ouvertes par débiteur (médiane)": float(per_debtor.median()) if len(per_debtor) else 0,
+                         "P99": float(per_debtor.quantile(0.99)) if len(per_debtor) else 0,
+                         "maximum": int(per_debtor.max()) if len(per_debtor) else 0,
+                         "part portée par les 10 plus gros": float(per_debtor.nlargest(10).sum() / max(len(stock), 1))})
+    return {"curve": curve, "age": age.rename_axis("retard au début du test").reset_index(), "debtors": debtors,
+            "total": pd.Series({"factures": len(inv), "ouvertes au début du test": len(stock), "début du test": t0})}
+
+
+def imputation_delays(interim: Path, purge_days: int, retention_days: int) -> dict:
+    """Délai entre l'arrivée d'un paiement et sa première imputation (jours)."""
+    pay = arrivals(interim)
+    first = _imputations(interim).groupby("payment_id")["ts"].min()
+    delay = (pay["payment_id"].map(first) - pay["day"]) / DAY
+    known = delay.dropna()
+    return {"describe": known.describe(percentiles=[0.5, 0.9, 0.95, 0.99]),
+            "jamais imputés": float(delay.isna().mean()),
+            "au-delà de la purge": float((known > purge_days).mean()) if len(known) else 0.0,
+            "au-delà de la rétention": float((known > retention_days).mean()) if len(known) else 0.0,
+            "purge": purge_days, "rétention": retention_days}
+
+
+def pending_batches(interim: Path, split: Split, retention_days: int, every_days: int = 7) -> pd.DataFrame:
+    """Taille du lot quotidien (majorant : sans les auto-validations du moteur, qui sortent aussi du reliquat),
+    un jour tous les `every_days` sur la validation et le test."""
+    pay = arrivals(interim)
+    first = _imputations(interim).groupby("payment_id")["ts"].min()
+    a = pay["day"].to_numpy()
+    f = pay["payment_id"].map(first).fillna(pd.Timestamp.max.normalize()).to_numpy()
+    rows = []
+    for p in split.periods:
+        if p.name == "train":
+            continue
+        for day in pd.date_range(p.start, p.end, freq=f"{every_days}D"):
+            d = np.datetime64(day)
+            window = (a <= d) & (a >= d - retention_days * DAY)
+            rows.append({"période": p.name, "jour": day, "paiements du jour": int((a == d).sum()),
+                         "lot (majorant)": int((window & (f >= d)).sum())})
+    return pd.DataFrame(rows)
+
+
+# --- Client files ------------------------------------------------------------------------------------------
+
+def client_file_conditions(interim: Path, date_tolerance_days: int) -> dict | None:
+    """Pour chaque client file dont le vrai paiement est retrouvé (via les factures citées et les imputations
+    réelles), quelles conditions du rattachement sont remplies. None : pas de client files chargés."""
+    base = Path(interim)
+    if not (base / "client_file.parquet").exists() or not (base / "client_file_line.parquet").exists():
+        return None
+    cf = _read(base, "client_file", ["file_id", "received_at", "total_amount", "payment_date", "iban",
+                                     "payment_reference", "payment_reference_norm"])
+    cfl = _read(base, "client_file_line", ["file_id", "invoice_reference", "invoice_reference_norm", "amount"])
+    inv = _read(base, "invoice", ["invoice_id", "client_reference_norm", "internal_reference_norm"])
+    imp = _read(base, "imputation", ["payment_id", "invoice_id"])
+    pay = _read(base, "payment", ["payment_id", "amount", "value_date", "iban_debtor", "label_norm"])
+    day = lambda s: _utc(s).dt.normalize()  # noqa: E731
+
+    fill = {f"client_file.{c}": cf[c].notna().mean() for c in
+            ("received_at", "total_amount", "payment_date", "iban", "payment_reference") if c in cf}
+    fill |= {f"client_file_line.{c}": cfl[c].notna().mean() for c in ("invoice_reference", "amount") if c in cfl}
+
+    compact = lambda s: s.fillna("").astype(str).str.replace(" ", "", regex=False)  # noqa: E731
+    ref_inv = pd.concat([pd.DataFrame({"ref": compact(inv[c]), "invoice_id": inv["invoice_id"]})
+                         for c in ("client_reference_norm", "internal_reference_norm") if c in inv])
+    ref_inv = ref_inv[ref_inv["ref"].str.len() >= 4].drop_duplicates()
+    lines = cfl.assign(ref=compact(cfl["invoice_reference_norm"]))
+    lines["n"] = lines["ref"].map(ref_inv.groupby("ref").size()).fillna(0).astype(int)
+    refs = lines["n"].clip(upper=2).map({0: "introuvable", 1: "une facture", 2: "plusieurs (ambiguë)"}) \
+        .value_counts(normalize=True)
+
+    hit = lines[lines["n"] == 1].merge(ref_inv, on="ref").merge(imp, on="invoice_id")
+    true_pay = (hit.groupby(["file_id", "payment_id"]).size().rename("lignes").reset_index()
+                .sort_values("lignes", ascending=False).drop_duplicates("file_id"))
+    f = cf.merge(true_pay, on="file_id").merge(pay, on="payment_id")
+    f = f.join(cfl.groupby("file_id")["amount"].sum(min_count=1).rename("somme_lignes"), on="file_id")
+    f = f.rename(columns={"amount": "montant_paiement"})
+    exact = f["total_amount"] == f["montant_paiement"]
+    date_ok = (day(f["payment_date"]) - day(f["value_date"])).dt.days.abs() <= date_tolerance_days
+    iban_ok = f["iban"].notna() & (f["iban"].astype(object) == f["iban_debtor"].astype(object))
+    ref_ok = pd.Series([isinstance(r, str) and bool(r) and r in (lbl or "")
+                        for r, lbl in zip(f.get("payment_reference_norm", pd.Series(dtype=object)), f["label_norm"])],
+                       index=f.index, dtype=bool)
+    corroborated = date_ok | iban_ok | ref_ok
+    shared = f["total_amount"].map(pay["amount"].value_counts()).fillna(0) > 1
+    conditions = pd.Series({
+        "montant total = montant du paiement (exact)": exact.mean(),
+        "total_amount vide": f["total_amount"].isna().mean(),
+        "somme des lignes = montant du paiement": (f["somme_lignes"] == f["montant_paiement"]).mean(),
+        f"date du fichier à ± {date_tolerance_days} j de la date de valeur": date_ok.mean(),
+        "IBAN du fichier = IBAN du paiement": iban_ok.mean(),
+        "référence de virement dans le libellé": ref_ok.mean(),
+        "au moins une corroboration": corroborated.mean(),
+        "montant exact et corroboré : rattachable": (exact & corroborated).mean(),
+        "dont montant partagé par plusieurs paiements (ambiguïté)": (exact & corroborated & shared).mean(),
+    }) if len(f) else pd.Series(dtype=float)
+    gap = (f["total_amount"] - f["montant_paiement"])[~exact & f["total_amount"].notna()] / 100
+    return {"fichiers": len(cf), "lignes": len(cfl), "vrai paiement retrouvé": len(true_pay),
+            "remplissage": pd.Series(fill), "références des lignes": refs, "conditions": conditions,
+            "délai de réception (j)": (day(f["received_at"]) - day(f["value_date"])).dt.days.describe(
+                percentiles=[0.05, 0.5, 0.95]),
+            "écart total − paiement (€)": gap.describe(percentiles=[0.05, 0.5, 0.95])}
+
+
+# --- Fuite F2 : IBAN non datés -----------------------------------------------------------------------------
+
+def iban_worst_case(interim: Path, split: Split, decisions: Path | None = None) -> dict:
+    """Part des paiements, et des auto-validations si l'export de décisions est donné, qui reposent peut-être sur
+    un IBAN révélé par le paiement lui-même (premier paiement imputé de cet IBAN pour ce débiteur). Majorant."""
+    base = Path(interim)
+    pay = arrivals(base).merge(_read(base, "payment", ["payment_id", "iban_debtor"]), on="payment_id")
+    pay["period"] = assign_period(pay["day"], split).to_numpy()
+    truth = (_read(base, "imputation", ["payment_id", "invoice_id"])
+             .merge(_read(base, "invoice", ["invoice_id", "debtor_id"]), on="invoice_id")[["payment_id", "debtor_id"]]
+             .drop_duplicates())
+    pdx = pay[pay["iban_debtor"].notna()].rename(columns={"iban_debtor": "iban"}).merge(truth, on="payment_id")
+    if (base / "party_iban.parquet").exists():
+        links = _read(base, "party_iban", ["role", "party_id", "iban"])
+        links = links[links["role"] == "debtor"]
+    else:
+        links = _read(base, "debtor", ["party_id", "iban"]).dropna()
+    links = links[["iban", "party_id"]].drop_duplicates().rename(columns={"party_id": "debtor_id"}).assign(known=True)
+    pdx = pdx.merge(links, on=["iban", "debtor_id"], how="left")
+    pdx["known"] = pdx["known"].fillna(False).astype(bool)
+    pdx["revealed"] = pdx["known"] & (pdx["day"] == pdx.groupby(["iban", "debtor_id"])["day"].transform("min"))
+    per_pay = pdx.groupby("payment_id").agg(period=("period", "first"), known=("known", "any"),
+                                            revealed=("revealed", "any"))
+    by_period = per_pay.groupby("period")[["known", "revealed"]].mean().rename(
+        columns={"known": "IBAN connu du référentiel", "revealed": "IBAN révélé par ce paiement (pire cas)"})
+    out = {"par période": by_period}
+    if decisions is not None and Path(decisions).exists():
+        d = pd.read_parquet(decisions, columns=["payment_id", "action", "step", "decision_retenue",
+                                                "decision_retenue_exacte"])
+        auto = d[d["decision_retenue"] & (d["action"] == "auto")].drop_duplicates("payment_id")
+        auto = auto.assign(revealed=auto["payment_id"].map(per_pay["revealed"]).fillna(False).astype(bool),
+                           ok=auto["decision_retenue_exacte"].astype(float))
+        out["auto-validations"] = auto.groupby(["step", "revealed"]).agg(auto_validations=("payment_id", "size"),
+                                                                         précision=("ok", "mean")).reset_index()
+        out["part révélée"] = float(auto["revealed"].mean()) if len(auto) else 0.0
+    return out
+
+
+# --- Précision des auto-validations ------------------------------------------------------------------------
+
+def clopper_pearson_lower(n: int, k: int, confidence: float = 0.95) -> float:
+    """Borne basse unilatérale de la précision k / n : la vraie précision est au-dessus avec cette confiance."""
+    if n <= 0:
+        return float("nan")
+    return float(beta.ppf(1 - confidence, k, n - k + 1)) if k > 0 else 0.0
+
+
+def with_precision_bounds(table: pd.DataFrame, n: str = "auto", k: str = "corrects") -> pd.DataFrame:
+    """Ajoute la borne basse à 95 % (« précision min. 95 % ») à un tableau de comptes (auto, corrects)."""
+    out = table.copy()
+    out["précision min. 95 %"] = [clopper_pearson_lower(int(a), int(c)) for a, c in zip(out[n], out[k])]
+    return out
+
+
+def threshold_curve(proposals: Path, min_margin: float, points: int = 200,
+                    applied: dict[str, float] | None = None) -> pd.DataFrame:
+    """Volume et précision des auto-validations ML selon τ_high, par type de proposition, sur la boucle de validation
+    enregistrée à la calibration (`<interim>/ml/validation_daily_proposals.parquet`).
+
+    Même règle que `calibrate_online` : un paiement rescoré chaque jour est auto-validé le premier jour où son score
+    (marge ≥ δ) franchit τ ; c'est la proposition de ce jour-là qui compte. `applied` (type → τ) : seuils ajoutés à
+    la grille, marqués dans la colonne `appliqué`."""
+    applied = applied or {}
+    r = pd.read_parquet(proposals, columns=["day", "payment_id", "kind", "score", "margin", "correct"])
+    rows = []
+    for kind, k in r.groupby("kind", sort=True):
+        k = k.assign(s=np.where(k["margin"] >= min_margin, k["score"], -np.inf))
+        k = k.sort_values(["payment_id", "day"], kind="mergesort")
+        best = k.groupby("payment_id")["s"].cummax()
+        prev = best.groupby(k["payment_id"]).shift(1).fillna(-np.inf).to_numpy()
+        s, ok = k["s"].to_numpy(), k["correct"].to_numpy()
+        setter = s > prev                                   # jours qui portent un nouveau maximum
+        s, prev, ok = s[setter], prev[setter], ok[setter]
+        finite = np.unique(s[np.isfinite(s)])
+        if not len(finite):
+            continue
+        taus = np.quantile(finite, np.linspace(0, 1, points), method="nearest")
+        chosen = applied.get(kind)
+        if chosen is not None and chosen <= 1:
+            taus = np.append(taus, chosen)
+        for tau in np.unique(taus):
+            m = (prev < tau) & (tau <= s)
+            n, c = int(m.sum()), int(ok[m].sum())
+            rows.append({"type": kind, "τ_high": float(tau), "auto-validations": n, "corrects": c,
+                         "précision": c / n if n else np.nan, "précision min. 95 %": clopper_pearson_lower(n, c),
+                         "appliqué": bool(chosen is not None and tau == chosen)})
+    return pd.DataFrame(rows, columns=["type", "τ_high", "auto-validations", "corrects", "précision",
+                                       "précision min. 95 %", "appliqué"])
+
+
+def importance_by_family(importance: pd.DataFrame) -> pd.DataFrame:
+    """Gain LightGBM (feature, gain) agrégé par famille de features (`FAMILIES`, plus base et compétition)."""
+    family = {f: name for name, cols in FAMILIES.items() for f in cols}
+    family |= {f: "base (sources, rang du montant)" for f in BASE} | {f: "compétition (pass 2)" for f in COMPETITION}
+    out = importance.assign(famille=importance["feature"].map(family).fillna("autre"))
+    out = out.groupby("famille").agg(features=("feature", "size"), gain=("gain", "sum")).reset_index()
+    out["part du gain"] = out["gain"] / out["gain"].sum()
+    return out.sort_values("gain", ascending=False, ignore_index=True)
+
+
+# Espace de noms « diagnostics » (src/diagnostics.py dans le dépôt).
+diagnostics = SimpleNamespace(**{n: globals()[n] for n in (
+    'arrivals', 'data_split', 'open_invoice_stock', 'imputation_delays', 'pending_batches',
+    'client_file_conditions', 'iban_worst_case', 'clopper_pearson_lower', 'with_precision_bounds',
+    'threshold_curve', 'importance_by_family')})
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# src/evaluation/analysis.py
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+"""Évaluation approfondie : une ligne par paiement du périmètre, pour comprendre les erreurs et le résiduel.
+
+Même périmètre, même vérité et même décision retenue que `evaluate` (src/evaluation/metrics.py) : paiements
+arrivés dans la période, imputations réelles toutes dates confondues, première auto-validation sinon première
+mise en revue. Colonnes ajoutées :
+
+- `issue` : auto juste, auto fausse, revue, aucune décision ;
+- `type_erreur` (auto fausse) : paiement jamais imputé, mauvais débiteur, bon débiteur mais autre facture,
+  ensemble incomplet, factures en trop, ensemble en partie juste ;
+- `raison` (paiement non auto-validé, avec imputation réelle) : premier blocage rencontré, du débiteur au seuil
+  (voir `REASONS`) ; le nombre de paiements par raison borne le gain possible du levier correspondant ;
+- segments : tranche de montant, canal, type, bankroll, IBAN, client file, statut d'allocation, type de groupe,
+  marché, taille du débiteur, délai d'imputation, mois ;
+- diagnostic ML (rapprocheur règles + ML) : candidats au premier passage en ML, rang et score de la vraie facture.
+"""
+
+
+
+
+AUTO_OK, AUTO_KO, IN_REVIEW, NO_DECISION = "auto juste", "auto fausse", "revue", "aucune décision"
+OUTCOMES = (AUTO_OK, AUTO_KO, IN_REVIEW, NO_DECISION)
+ERROR_TYPES = ("paiement jamais imputé", "mauvais débiteur", "bon débiteur, autre facture", "ensemble incomplet",
+               "factures en trop", "ensemble en partie juste")
+NO_TRUTH = "sans imputation réelle"
+REASONS = (
+    "proposition juste, score sous τ_high",
+    "proposition juste, non auto-validable (marge au second, ou type sans seuil)",
+    "aucun débiteur alloué",
+    "vrai débiteur absent de l'allocation",
+    "aucune règle applicable sans ambiguïté",
+    "aucun candidat ML",
+    "vraie facture absente des candidats (débiteur non alloué)",
+    "vraie facture absente des candidats",
+    "ensemble : factures manquantes dans les candidats",
+    "ensemble candidat, non reconstitué",
+    "vraie facture candidate, pas en tête",
+    "proposition fausse malgré la vraie facture en tête",
+    "vraie facture en tête, score sous τ_low",
+    NO_TRUTH,
+)
+SEGMENTS = {
+    "Tranche de montant": "tranche_montant", "Canal": "canal", "Type de paiement": "type_paiement",
+    "Bankroll": "bankroll", "IBAN": "iban", "Route IBAN": "route_iban", "Client file": "client_file",
+    "Allocation": "allocation", "Type de groupe réel": "type_groupe", "Marché": "marché", "Produit": "produit",
+    "Taille du débiteur (factures)": "taille_débiteur", "Délai d'imputation": "délai_imputation",
+    "Mois d'arrivée": "mois", "Étape de décision": "étape", "Règle": "règle",
+}
+AMOUNT_EDGES = [-np.inf, 100, 1_000, 10_000, 100_000, np.inf]
+AMOUNT_LABELS = ["< 100 €", "100 – 1 000 €", "1 000 – 10 000 €", "10 000 – 100 000 €", "≥ 100 000 €"]
+SIZE_EDGES = [0, 10, 100, 1_000, np.inf]
+SIZE_LABELS = ["1 – 10", "11 – 100", "101 – 1 000", "> 1 000"]
+DELAY_EDGES = [-np.inf, 1, 7, 30, 60, np.inf]
+DELAY_LABELS = ["≤ 1 j", "2 – 7 j", "8 – 30 j", "31 – 60 j", "> 60 j"]
+MISSING = "non renseigné"
+
+
+def _pairs(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+    """(payment_id, invoice_id) depuis une colonne de tuples de factures."""
+    f = frame[frame[column].map(lambda v: isinstance(v, (tuple, list, np.ndarray)) and len(v) > 0)]
+    lengths = f[column].map(len).to_numpy(dtype=np.int64)
+    return pd.DataFrame({"payment_id": np.repeat(f["payment_id"].to_numpy(dtype=object), lengths),
+                         "invoice_id": [i for t in f[column] for i in t]})
+
+
+def _joined(pairs: pd.DataFrame, value: str) -> pd.Series:
+    """Valeurs distinctes de `value` par paiement, jointes par « · » (ordre d'apparition)."""
+    d = pairs[["payment_id", value]].dropna().drop_duplicates().sort_values("payment_id", kind="mergesort")
+    keys, groups = _tuples_by_key(d["payment_id"].to_numpy(dtype=object), d[value].astype(str).to_numpy(dtype=object))
+    return pd.Series([" · ".join(g) for g in groups], index=keys, dtype=object)
+
+
+def _error_type(pred: tuple, truth, pred_debtors: set, truth_debtors: set) -> str:
+    if not isinstance(truth, tuple):
+        return ERROR_TYPES[0]
+    p, t = set(pred), set(truth)
+    if p < t:
+        return "ensemble incomplet"
+    if t < p:
+        return "factures en trop"
+    if p & t:
+        return "ensemble en partie juste"
+    return "bon débiteur, autre facture" if set(pred_debtors) & set(truth_debtors) else "mauvais débiteur"
+
+
+def _candidate_stats(candidates: pd.DataFrame, true_pairs: pd.DataFrame) -> pd.DataFrame:
+    """Par paiement passé en ML : candidats, score du premier, rang et score de la meilleure vraie facture."""
+    c = candidates[["payment_id", "invoice_id", "p"]].merge(true_pairs.assign(vraie=True), how="left",
+                                                           on=["payment_id", "invoice_id"])
+    c["vraie"] = c["vraie"].fillna(False).astype(bool)
+    c = c.sort_values(["payment_id", "p"], ascending=[True, False], kind="mergesort")
+    c["rang"] = c.groupby("payment_id", sort=False).cumcount() + 1
+    g = c.groupby("payment_id", sort=False)
+    out = pd.DataFrame({"candidats": g.size(), "score_premier": g["p"].first(), "premier_vrai": g["vraie"].first(),
+                        "vraies_candidates": g["vraie"].sum()})
+    true = c[c["vraie"]].groupby("payment_id", sort=False)
+    out["rang_vraie"] = true["rang"].min()
+    out["score_vraie"] = true["p"].max()
+    return out
+
+
+def analyze_payments(decisions: pd.DataFrame, truth: pd.DataFrame, scope: pd.DataFrame, payment: pd.DataFrame,
+                     invoice: pd.DataFrame, agreement: pd.DataFrame, imputation: pd.DataFrame,
+                     candidates: pd.DataFrame | None = None, info: pd.DataFrame | None = None,
+                     thresholds: dict | None = None) -> pd.DataFrame:
+    """Une ligne par paiement du périmètre (voir la docstring du module).
+
+    `payment` : payment_id, amount, label, channel, payment_type, bankroll_code, iban_debtor ;
+    `invoice` : invoice_id, debtor_id, agreement_id, client_reference ; `agreement` : agreement_id, market,
+    product ; `imputation` : payment_id, updated_at ; `candidates` : premier passage en ML (payment_id,
+    invoice_id, p) ; `info` : allocation au jour d'arrivée (client_file_id, allocation_status, iban_route,
+    allocation_debtors) ; `thresholds` : seuils du modèle (kinds, tau_high)."""
+    props = _proposals(decisions)
+    p = (scope[["payment_id", "arrival_day"]].merge(truth, on="payment_id", how="left")
+         .merge(props, on="payment_id", how="left"))
+    has_truth = p["truth_invoices"].notna()
+    same = pd.Series([isinstance(a, tuple) and isinstance(b, tuple) and a == b
+                      for a, b in zip(p["invoices"], p["truth_invoices"])], index=p.index)
+    auto, review = p["action"] == AUTO, p["action"] == REVIEW
+    p["issue"] = np.select([auto & same, auto, review], [AUTO_OK, AUTO_KO, IN_REVIEW], NO_DECISION)
+    p["proposition_juste"] = same & p["action"].notna()
+
+    # Attributs du paiement.
+    ids = set(p["payment_id"])
+    pay = payment[payment["payment_id"].isin(ids)].drop_duplicates("payment_id").set_index("payment_id")
+    p["montant"] = p["payment_id"].map(pay["amount"]).astype("Float64") / 100
+    p["tranche_montant"] = pd.cut(p["montant"].astype(float), AMOUNT_EDGES, labels=AMOUNT_LABELS, right=False) \
+        .astype(object).fillna(MISSING)
+    p["libellé"] = p["payment_id"].map(pay["label"])
+    for col, src in (("canal", "channel"), ("type_paiement", "payment_type"), ("bankroll", "bankroll_code")):
+        p[col] = p["payment_id"].map(pay[src]).astype(object).fillna(MISSING) if src in pay else MISSING
+    p["iban"] = np.where(p["payment_id"].map(pay["iban_debtor"]).notna(), "IBAN présent", "IBAN absent") \
+        if "iban_debtor" in pay else MISSING
+    p["mois"] = pd.to_datetime(p["arrival_day"]).dt.strftime("%Y-%m")
+    p["type_groupe"] = p["group_type"].fillna(NO_TRUTH)
+    p["étape"] = p["step"].fillna("—")
+    p["règle"] = p["rule_id"].fillna("—")
+
+    first_imp = imputation[imputation["payment_id"].isin(ids)].groupby("payment_id")["updated_at"].min()
+    delay = (p["payment_id"].map(first_imp) - pd.to_datetime(p["arrival_day"])).dt.total_seconds() / 86_400
+    p["délai_imputation"] = pd.cut(delay, DELAY_EDGES, labels=DELAY_LABELS).astype(object).fillna("jamais imputé")
+
+    # Factures réelles et proposées : débiteurs, références, contrat.
+    inv_cols = [c for c in ("invoice_id", "debtor_id", "agreement_id", "client_reference") if c in invoice]
+    true_pairs = _pairs(p, "truth_invoices")
+    look = invoice[inv_cols][invoice["invoice_id"].isin(set(true_pairs["invoice_id"]))]
+    tp = true_pairs.merge(look, on="invoice_id", how="left")
+    p["débiteur_réel"] = p["payment_id"].map(_joined(tp, "debtor_id"))
+    p["factures_réelles"] = p["payment_id"].map(_joined(tp, "client_reference"))
+    agr = agreement.drop_duplicates("agreement_id").set_index("agreement_id")
+    first = tp.drop_duplicates("payment_id").set_index("payment_id")
+    for col, src in (("marché", "market"), ("produit", "product")):
+        p[col] = p["payment_id"].map(first["agreement_id"].map(agr[src])).astype(object).fillna(MISSING) \
+            if src in agr else MISSING
+    sizes = invoice["debtor_id"].value_counts()
+    n_inv = p["payment_id"].map(first["debtor_id"].map(sizes))
+    p["taille_débiteur"] = pd.cut(n_inv.astype(float), SIZE_EDGES, labels=SIZE_LABELS).astype(object).fillna(MISSING)
+
+    shown = p[p["issue"] != AUTO_OK]
+    pred_pairs = _pairs(shown, "invoices")
+    pp = pred_pairs.merge(invoice[inv_cols][invoice["invoice_id"].isin(set(pred_pairs["invoice_id"]))],
+                          on="invoice_id", how="left")
+    p["factures_proposées"] = p["payment_id"].map(_joined(pp, "client_reference"))
+    p["débiteur_proposé"] = p["payment_id"].map(_joined(pp, "debtor_id"))
+
+    # Type d'erreur des auto-validations fausses.
+    wrong = p["issue"] == AUTO_KO
+    wrong_ids = set(p.loc[wrong, "payment_id"])
+    pred_deb = pp[pp["payment_id"].isin(wrong_ids)].groupby("payment_id")["debtor_id"].agg(set)
+    true_deb = tp[tp["payment_id"].isin(wrong_ids)].groupby("payment_id")["debtor_id"].agg(set)
+    p["type_erreur"] = ""
+    p.loc[wrong, "type_erreur"] = [
+        _error_type(pred, t, pred_deb.get(pid, set()), true_deb.get(pid, set()))
+        for pid, pred, t in zip(p.loc[wrong, "payment_id"], p.loc[wrong, "invoices"], p.loc[wrong, "truth_invoices"])]
+
+    # Allocation au jour d'arrivée.
+    allocated = pd.Series(np.nan, index=p.index, dtype=object)
+    if info is not None and len(info):
+        inf = info.drop_duplicates("payment_id").set_index("payment_id")
+        p["client_file"] = np.where(p["payment_id"].map(inf["client_file_id"]).notna(), "avec client file",
+                                    "sans client file")
+        p["allocation"] = p["payment_id"].map(inf["allocation_status"]).astype(object).fillna(MISSING)
+        p["route_iban"] = p["payment_id"].map(inf["iban_route"]).astype(object).fillna(MISSING) \
+            if "iban_route" in inf else MISSING
+        if "allocation_debtors" in inf:
+            alloc_pairs = _pairs(inf.reset_index()[["payment_id", "allocation_debtors"]], "allocation_debtors") \
+                .rename(columns={"invoice_id": "debtor_id"})
+            found = tp[["payment_id", "debtor_id"]].merge(alloc_pairs, on=["payment_id", "debtor_id"])
+            known = p["payment_id"].isin(set(inf.index))
+            allocated = pd.Series(np.where(known, p["payment_id"].isin(set(found["payment_id"])), np.nan),
+                                  index=p.index, dtype=object)
+            n_alloc = p["payment_id"].map(inf["allocation_debtors"].map(len))
+            p["débiteurs_alloués"] = n_alloc
+    else:
+        p["client_file"] = p["allocation"] = p["route_iban"] = MISSING
+    p["vrai_débiteur_alloué"] = allocated
+
+    # Candidats ML au premier passage.
+    ml = candidates is not None
+    if ml:
+        stats = _candidate_stats(candidates[candidates["payment_id"].isin(ids)], true_pairs)
+        for col in stats.columns:
+            p[col] = p["payment_id"].map(stats[col])
+
+    p["raison"] = _reasons(p, ml, thresholds)
+    p["invoices"] = p["invoices"].map(lambda v: list(v) if isinstance(v, tuple) else [])
+    p["truth_invoices"] = p["truth_invoices"].map(lambda v: list(v) if isinstance(v, tuple) else [])
+    return p.drop(columns=["group_type", "step", "rule_id"]).rename(
+        columns={"invoices": "factures_proposées_id", "truth_invoices": "factures_réelles_id", "n_invoices":
+                 "nb_factures_réelles", "day": "jour_décision"})
+
+
+def _reasons(p: pd.DataFrame, ml: bool, thresholds: dict | None) -> pd.Series:
+    """Premier blocage rencontré par chaque paiement non auto-validé (vide sinon)."""
+    out = pd.Series("", index=p.index, dtype=object)
+    residual = p["issue"].isin([IN_REVIEW, NO_DECISION])
+    no_truth = p["truth_invoices"].isna()
+    out[residual & no_truth] = NO_TRUTH
+    todo = residual & ~no_truth
+    kinds = (thresholds or {}).get("kinds", {})
+    default_tau = (thresholds or {}).get("tau_high", 1.01)
+    right = todo & p["proposition_juste"]
+    if right.any():
+        # Type de proposition ML dans l'identifiant de règle (ML_SINGLE, ML_SET, ML_PARTIAL, ML_NN).
+        kind = p.loc[right, "rule_id"].fillna("").str.removeprefix("ML_").str.lower()
+        tau = kind.map(lambda k: kinds.get(k, default_tau)).astype(float)
+        blocked = (kind == "nn") | (tau > 1) | (p.loc[right, "score"].fillna(0) >= tau)
+        out[right] = np.where(blocked, REASONS[1], REASONS[0])
+    todo &= ~right
+    status = p["allocation"] if "allocation" in p else pd.Series(MISSING, index=p.index)
+    allocated = p["vrai_débiteur_alloué"]
+    none_alloc = status.isin(["aucun", "aucune", "none"]) | (p.get("débiteurs_alloués", pd.Series(np.nan, index=p.index)) == 0)
+    if not ml:
+        out[todo & none_alloc] = REASONS[2]
+        out[todo & ~none_alloc & (allocated == False)] = REASONS[3]  # noqa: E712
+        out[todo & (out == "")] = REASONS[4]
+        return out
+    in_ml = p["candidats"].notna()
+    out[todo & ~in_ml & none_alloc] = REASONS[2]
+    out[todo & ~in_ml & ~none_alloc] = REASONS[5]
+    todo &= in_ml
+    n_inv = p["n_invoices"].fillna(0)
+    complete = p["vraies_candidates"].fillna(0) >= n_inv
+    some = p["vraies_candidates"].fillna(0) > 0
+    out[todo & ~complete & some] = REASONS[8]
+    out[todo & ~complete & ~some & (allocated == False)] = REASONS[6]  # noqa: E712
+    out[todo & ~complete & ~some & (allocated != False)] = REASONS[7]  # noqa: E712
+    todo &= complete
+    out[todo & (n_inv > 1)] = REASONS[9]
+    todo &= n_inv <= 1
+    top = p["premier_vrai"].fillna(False).astype(bool)
+    out[todo & ~top] = REASONS[10]
+    out[todo & top & (p["issue"] == IN_REVIEW)] = REASONS[11]
+    out[todo & top & (p["issue"] == NO_DECISION)] = REASONS[12]
+    return out
+
+
+# --- Tableaux ------------------------------------------------------------------------------------------------
+
+def rate_by(p: pd.DataFrame, column: str) -> pd.DataFrame:
+    """Par valeur d'un segment : paiements, auto-validés, justes, précision et sa borne basse, automatisation."""
+    g = p.assign(_auto=p["issue"].isin([AUTO_OK, AUTO_KO]), _ok=p["issue"] == AUTO_OK,
+                 _review=p["issue"] == IN_REVIEW).groupby(column, dropna=False, sort=True)
+    out = pd.DataFrame({"paiements": g.size(), "auto": g["_auto"].sum(), "justes": g["_ok"].sum(),
+                        "revue": g["_review"].sum()}).reset_index()
+    out["part des paiements"] = out["paiements"] / max(len(p), 1)
+    out["taux d'automatisation"] = out["auto"] / out["paiements"]
+    out["précision"] = out["justes"] / out["auto"].where(out["auto"] > 0)
+    out["précision min. 95 %"] = [clopper_pearson_lower(int(a), int(c)) for a, c in zip(out["auto"], out["justes"])]
+    return out
+
+
+def reason_table(p: pd.DataFrame) -> pd.DataFrame:
+    """Résiduel : paiements par raison, et ce que chaque levier rapporterait au plus (points d'automatisation)."""
+    r = p[p["raison"] != ""]
+    out = r["raison"].value_counts().rename("paiements").rename_axis("raison").reset_index()
+    out["part du résiduel"] = out["paiements"] / max(len(r), 1)
+    out["gain maximal (points)"] = np.where(out["raison"] == NO_TRUTH, np.nan, 100 * out["paiements"] / max(len(p), 1))
+    order = {r: i for i, r in enumerate(REASONS)}
+    return out.assign(_o=out["raison"].map(order)).sort_values("_o").drop(columns="_o").reset_index(drop=True)
+
+
+def error_table(p: pd.DataFrame, by: str = "règle") -> pd.DataFrame:
+    """Auto-validations fausses par type d'erreur et par règle (ou étape)."""
+    wrong = p[p["issue"] == AUTO_KO]
+    if wrong.empty:
+        return pd.DataFrame(columns=["type d'erreur", "total"])
+    table = pd.crosstab(wrong["type_erreur"], wrong[by])
+    table["total"] = table.sum(axis=1)
+    order = [e for e in ERROR_TYPES if e in table.index]
+    return table.loc[order].rename_axis("type d'erreur").reset_index()
+
+
+def compare_outcomes(before: pd.DataFrame, after: pd.DataFrame) -> pd.DataFrame:
+    """Issue de chaque paiement sous deux rapprocheurs (ex. règles seules → règles + ML), mêmes paiements."""
+    m = before[["payment_id", "issue"]].merge(after[["payment_id", "issue"]], on="payment_id", suffixes=(" avant", " après"))
+    table = pd.crosstab(m["issue avant"], m["issue après"])
+    table = table.reindex(index=[o for o in OUTCOMES if o in table.index],
+                          columns=[o for o in OUTCOMES if o in table.columns], fill_value=0)
+    return table
+
+
+def summary(p: pd.DataFrame) -> dict:
+    n = len(p)
+    counts = p["issue"].value_counts()
+    auto = int(counts.get(AUTO_OK, 0) + counts.get(AUTO_KO, 0))
+    return {"paiements": n, **{k: int(counts.get(k, 0)) for k in OUTCOMES},
+            "taux_automatisation": auto / n if n else 0.0,
+            "précision": counts.get(AUTO_OK, 0) / auto if auto else None,
+            "précision_min_95": clopper_pearson_lower(auto, int(counts.get(AUTO_OK, 0))) if auto else None,
+            "erreurs_par_type": p.loc[p["issue"] == AUTO_KO, "type_erreur"].value_counts().to_dict(),
+            "résiduel_par_raison": p.loc[p["raison"] != "", "raison"].value_counts().to_dict()}
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -7010,10 +7959,67 @@ class Project:
         return {"summary": summary, **tables}
 
     @_tracked
+    def analyze(self, period: str = "test", matcher: str = "pipeline") -> dict:
+        """Évaluation approfondie d'un rejeu : une ligne par paiement (issue, type d'erreur, raison du résiduel,
+        segments, diagnostic ML) dans `reports/analysis_<matcher>_<period>.parquet` (src/evaluation/analysis.py)."""
+        tag = f"replay_{matcher}_{period}"
+        context, decisions, truth, scope = self._replay_outputs(period, matcher)
+        base, replay_dir = self.interim_dir, self.interim_dir / "replay"
+        read = lambda name, cols=None: pd.read_parquet(base / f"{name}.parquet", columns=cols)  # noqa: E731
+        side = lambda name: (pd.read_parquet(replay_dir / f"{tag}_{name}.parquet")  # noqa: E731
+                             if (replay_dir / f"{tag}_{name}.parquet").exists() else None)
+        candidates = side("ml_candidates")
+        if candidates is not None:
+            candidates = candidates[["payment_id", "invoice_id", "p"]]
+        thresholds = None
+        if matcher == "pipeline" and (self.model_dir / "model.json").exists():
+            thresholds = json.loads((self.model_dir / "model.json").read_text(encoding="utf-8")).get("thresholds")
+        payment = read("payment")
+        payment = payment[[c for c in ("payment_id", "amount", "label", "channel", "payment_type", "bankroll_code",
+                                       "iban_debtor") if c in payment]]
+        payments = analysis.analyze_payments(
+            decisions, truth, scope, payment,
+            read("invoice", ["invoice_id", "debtor_id", "agreement_id", "client_reference"]),
+            read("agreement", ["agreement_id", "market", "product"]),
+            read("imputation", ["payment_id", "updated_at"]), candidates, side("payment_info"), thresholds)
+        out = self.reports_dir / f"analysis_{matcher}_{period}"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payments.to_parquet(out.with_suffix(".parquet"), index=False)
+        summary = analysis.summary(payments)
+        payload = {"context": {**context, "ml_candidates": candidates is not None,
+                               "payment_info": side("payment_info") is not None}, "summary": summary}
+        out.with_suffix(".json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+                                            encoding="utf-8")
+        self.log(f"  analyse : {len(payments)} paiements → {out.with_suffix('.parquet')}")
+        return {"summary": summary, "payments": payments}
+
+    @_tracked
     def backtest(self, period: str = "test", matcher: str = "pipeline") -> dict:
-        """Rejeu puis évaluation (étape 6)."""
+        """Rejeu, évaluation (étape 6) et évaluation approfondie."""
         self.replay(period, matcher)
-        return self.evaluate(period, matcher)
+        result = self.evaluate(period, matcher)
+        self.analyze(period, matcher)
+        return result
+
+    # --- Ingestion des sources réelles --------------------------------------------------------------------------
+
+    @_tracked
+    def validate_sources(self) -> dict:
+        """Contrôle des sources réelles avant chargement : chaque table de config/schema.yaml lue en entier,
+        convertie comme au chargement, puis les contrôles qualité. Rapports `reports/sources_validation_*`."""
+        schema_cfg = read_yaml(self.schema_path)
+        base = resolve_path(schema_cfg.get("base_dir") or ".")
+        result = validate_sources(schema_cfg, base, log=self.log)
+        rep = self.reports_dir
+        rep.mkdir(parents=True, exist_ok=True)
+        for name in ("fields", "conversion", "quality", "volumes"):
+            result[name].to_csv(rep / f"sources_validation_{name}.csv", index=False)
+        summary = {"schema": str(self.schema_path), "base_dir": str(base), "bloquants": result["problems"],
+                   "anomalies_qualité": int(len(result["quality"])), "prêt_à_charger": not result["problems"],
+                   "date": time.strftime("%Y-%m-%d %H:%M:%S")}
+        (rep / "sources_validation.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False),
+                                                     encoding="utf-8")
+        return {"summary": summary, **{k: v for k, v in result.items() if k != "problems"}}
 
     def report(self, matcher: str = "pipeline", period: str = "test") -> dict:
         """Relit une évaluation déjà calculée (sans recalcul)."""
@@ -7025,13 +8031,29 @@ class Project:
 
 
 def run_task(task: str, kwargs: dict) -> None:
-    """Exécute une méthode de `Project` dans un processus séparé (utilisé par l'interface)."""
+    """Exécute une méthode de `Project` dans un processus séparé (utilisé par l'interface).
+
+    `_monitor` : suivi du temps et de la mémoire dans `<reports_dir>/memory.csv` (comme le notebook) ;
+    `_profile` : profil par fonction dans `<reports_dir>/profiles` (src/profiling.py)."""
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
+    monitored, profiled = kwargs.pop("_monitor", False), kwargs.pop("_profile", False)
     project_args = {k: kwargs.pop(k) for k in ("dataset", "settings_path", "schema_path", "rules_path") if k in kwargs}
-    project = Project(**project_args, log=lambda m: print(m, flush=True))
-    result = getattr(project, task)(**kwargs)
+    echo = lambda m: print(m, flush=True)  # noqa: E731
+    project = Project(**project_args, log=echo)
+    runtime = resolve_path(project.settings.paths.reports_dir)
+    monitor = memory.MemoryMonitor(runtime / "memory.csv", echo=echo).start() if monitored else None
+    if monitor is not None:
+        project.log = monitor.log
+    prof = Profiler(runtime / "profiles", enabled=profiled, log=echo)
+    name = " · ".join([task, project.dataset, *(str(v) for v in kwargs.values())])
+    try:
+        with prof(name):
+            result = getattr(project, task)(**kwargs)
+    finally:
+        if monitor is not None:
+            monitor.stop()
     summary = result.get("summary") if isinstance(result, dict) else None
     if summary is not None:
         print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))

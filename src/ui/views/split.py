@@ -8,8 +8,8 @@ from pydantic import ValidationError
 from src.settings import SplitSettings
 from src.timeline.split import OUTSIDE, PERIODS, PURGE, SplitError, assign_period, compute_split
 from src.ui.common import (
-    SYNTHETIC, current_settings, dataset, interim_dir, read_parquet, render_model, reports_dir,
-    require_loaded_data, run_task, save_section, settings_path, step_header, validation_errors,
+    current_settings, diagnostic, interim_dir, pct, read_parquet, render_model, reports_dir, require_loaded_data,
+    run_task, save_section, step_header, validation_errors,
 )
 
 step_header("split")
@@ -88,6 +88,42 @@ with right:
     st.altair_chart(chart, width="stretch")
     st.caption("L'aperçu suit les valeurs saisies, même non enregistrées. Les paiements sont datés par "
                "leur date de connaissance (booking_date si disponible, sinon value_date).")
+
+# --- Purge, rétention, lot quotidien ----------------------------------------------------------------
+st.divider()
+st.subheader("Purge, rétention et lot quotidien")
+st.caption("La purge doit couvrir le délai entre l'arrivée d'un paiement et son imputation : sinon un paiement de fin "
+           "d'entraînement a son label dans la validation (fuite F3). La rétention borne le reliquat : un paiement "
+           "imputé plus tard sort du lot sans décision. Le lot quotidien (paiements du jour + reliquat) fixe le coût "
+           "de chaque jour du rejeu.")
+if st.toggle("Calculer (quelques secondes, mis en cache)", key="split.diagnostics"):
+    delays = diagnostic("imputation_delays", base, cfg.purge_days, cfg.retention_days)
+    d = delays["describe"]
+    m = st.columns(5)
+    m[0].metric("Délai médian", f"{d['50%']:.1f} j")
+    m[1].metric("P95", f"{d['95%']:.1f} j")
+    m[2].metric(f"Imputés après la purge ({cfg.purge_days} j)", pct(delays["au-delà de la purge"]),
+                help="Part des paiements imputés dont le délai dépasse la purge : leur label peut franchir la frontière "
+                     "entre deux périodes.")
+    m[3].metric(f"Imputés après la rétention ({cfg.retention_days} j)", pct(delays["au-delà de la rétention"]),
+                help="Sortis du reliquat avant leur imputation : jamais proposés.")
+    m[4].metric("Jamais imputés", pct(delays["jamais imputés"]))
+    if delays["au-delà de la purge"] > 0.01:
+        st.warning(f"{pct(delays['au-delà de la purge'])} des paiements sont imputés après la purge : l'augmenter "
+                   f"(P95 = {d['95%']:.0f} j, P99 = {d['99%']:.0f} j).", icon=":material/warning:")
+    batches = diagnostic("pending_batches", base, split, cfg.retention_days)
+    if len(batches):
+        long_b = batches.melt(id_vars=["période", "jour"], value_vars=["paiements du jour", "lot (majorant)"],
+                              var_name="mesure", value_name="paiements")
+        st.altair_chart(alt.Chart(long_b).mark_line(point=True).encode(
+            x=alt.X("jour:T", title=None, axis=alt.Axis(format="%d/%m/%Y")), y=alt.Y("paiements:Q"),
+            color=alt.Color("mesure:N", title=None, legend=alt.Legend(orient="top")),
+            tooltip=[alt.Tooltip("jour:T", format="%d/%m/%Y"), "période:N", "mesure:N",
+                     alt.Tooltip("paiements:Q", format=",")],
+        ).properties(height=240, title="Lot quotidien sur la validation et le test (un jour par semaine)"),
+            width="stretch")
+        st.caption("Majorant : le reliquat compte les paiements non encore imputés, sans les auto-validations du "
+                   "moteur, qui le vident aussi.")
 
 # --- Rejeu quotidien ------------------------------------------------------------------------------
 st.divider()

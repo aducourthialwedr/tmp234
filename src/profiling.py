@@ -18,10 +18,13 @@ Deux moteurs, même sortie : des piles « repliées » (`f1;f2;f3 n`), lisibles 
   (10 par défaut), soit environ 0,1 ms de travail par relevé ; impact inférieur à 1 %.
 
 Une fonction est rangée par sa ligne de définition, pas par la ligne en cours : ses relevés se cumulent.
+Chaque mesure écrit aussi `<nom>.json` (durée, moteur) : `saved_runs(folder)` et `saved_summary(run)` relisent
+les profils d'une session précédente (page « Temps de run » de l'interface).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -157,17 +160,38 @@ class Profiler:
             sampler.stop(output)
             self.runs[name] = {"fichier": output, "secondes": time.perf_counter() - start, "moteur": engine,
                                "rate": self.rate}
+            meta = {**self.runs[name], "nom": name, "fichier": output.name, "fin": time.strftime("%Y-%m-%d %H:%M:%S")}
+            output.with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             self.log(f"  profil « {name} » : {self.runs[name]['secondes']:.0f} s, {engine} → {output}")
 
     def summary(self, name: str | None = None, top: int = 25) -> pd.DataFrame:
         """Tableau du profil `name` (le dernier si absent) : voir `stack_summary`."""
         if not self.runs:
             raise ValueError("aucun profil : activer le profileur (enabled=True) puis relancer l'étape")
-        run = self.runs[name] if name else list(self.runs.values())[-1]
-        # Le fil interne peut relever moins souvent que prévu (GIL, horloge) : ses durées sont calées sur le temps
-        # écoulé. py-spy respecte sa fréquence et n'enregistre pas l'inactivité : ses relevés valent 1 / rate.
-        seconds = run["secondes"] if run["moteur"] == "fil interne" else None
-        return stack_summary(run["fichier"], rate=run["rate"], top=top, seconds=seconds)
+        return _run_summary(self.runs[name] if name else list(self.runs.values())[-1], top)
+
+
+def _run_summary(run: dict, top: int) -> pd.DataFrame:
+    # Le fil interne peut relever moins souvent que prévu (GIL, horloge) : ses durées sont calées sur le temps
+    # écoulé. py-spy respecte sa fréquence et n'enregistre pas l'inactivité : ses relevés valent 1 / rate.
+    seconds = run["secondes"] if run["moteur"] == "fil interne" else None
+    return stack_summary(run["fichier"], rate=run["rate"], top=top, seconds=seconds)
+
+
+def saved_runs(folder: str | Path = "reports/profiles") -> pd.DataFrame:
+    """Profils enregistrés dans le dossier (notebook ou interface), du plus récent au plus ancien."""
+    rows = []
+    for meta_path in Path(folder).glob("*.json"):
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if (meta_path.parent / meta["fichier"]).exists():
+            rows.append({**meta, "fichier": str(meta_path.parent / meta["fichier"])})
+    out = pd.DataFrame(rows, columns=["nom", "fin", "secondes", "moteur", "rate", "fichier"])
+    return out.sort_values("fin", ascending=False, ignore_index=True)
+
+
+def saved_summary(run: dict, top: int = 25) -> pd.DataFrame:
+    """Tableau d'un profil enregistré (une ligne de `saved_runs`)."""
+    return _run_summary(run, top)
 
 
 def _parse(path: Path) -> list[tuple[list[str], int]]:

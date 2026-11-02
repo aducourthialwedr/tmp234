@@ -242,11 +242,14 @@ def ml_diagnostics(candidates: pd.DataFrame, truth: pd.DataFrame, scope: pd.Data
     calib = c.assign(bin=b).groupby("bin").agg(paires=("label", "size"), score_moyen=("p", "mean"),
                                                taux_observé=("label", "mean")).reset_index()
     calib["tranche"] = [f"{edges[i]:.1f}–{edges[i + 1]:.1f}" for i in calib["bin"]]
+    found = first.dropna()                     # paiements dont une vraie facture est candidate (périmètre de la validation)
     return {
         "paiements_en_ml": int(len(got)),
         "rappel_candidats": float(recall),
         "precision_at_1": float((first == 1).mean()),
         "mrr": float((1.0 / first).fillna(0).mean()),
+        "precision_at_1_avec_positif": float((found == 1).mean()) if len(found) else None,
+        "mrr_avec_positif": float((1.0 / found).mean()) if len(found) else None,
     }, calib[["tranche", "paires", "score_moyen", "taux_observé"]]
 
 

@@ -64,9 +64,16 @@ l'interface.
 streamlit run src/ui/app.py
 ```
 
-Une page par étape : configuration, chargement, découpage, allocation, règles, ML, évaluation. Les
-boutons exécutent les mêmes méthodes de `Project` que le notebook. Écoute locale uniquement,
-télémétrie désactivée (`.streamlit/config.toml`).
+Une page par étape : configuration, chargement, découpage, allocation, règles, ML, évaluation, plus une
+vue d'ensemble (dernier résultat de chaque étape, ce qui est à relancer) et une page « Temps de run ». Chaque
+page édite sa section de `config/settings.yaml` et affiche ses diagnostics (`src/diagnostics.py` : stock de
+factures ouvertes, délais d'imputation et purge, rattachement des client files, courbe des seuils, borne basse
+de la précision, fuite F2). Les boutons exécutent les mêmes méthodes de `Project` que le notebook, dans un
+processus séparé, avec suivi du temps et de la mémoire (`reports/memory.csv`) et, à la demande, profil par
+fonction. Écoute locale uniquement, télémétrie désactivée (`.streamlit/config.toml`).
+
+La version en un fichier `single/reconciliation_ui.py` est générée depuis `src/ui` par
+`python tools/build_single_ui.py` (un test vérifie qu'elle est à jour).
 
 ## Organisation du code
 

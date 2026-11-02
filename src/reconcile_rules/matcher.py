@@ -73,6 +73,7 @@ class RulesMatcher:
         self._claims: dict[int, list[tuple[int, int]]] = {}         # paiement → [(facture, montant)]
         self._proposed: set[tuple[str, int]] = set()
         self._proposals: list[pd.DataFrame] = []
+        self._info: list[pd.DataFrame] = []
         self.last_allocation = None
 
     # --- Registre des réservations ------------------------------------------------------------------
@@ -243,6 +244,7 @@ class RulesMatcher:
         amount = self._pay_amount[pos]
         alloc = self.allocator.allocate(ctx)
         self.last_allocation = alloc
+        self._record_info(ctx, alloc, batch_ids)
         scopes = self._scopes(alloc, batch_ids)
 
         by_rule: dict[str, pd.DataFrame] = {}
@@ -345,6 +347,28 @@ class RulesMatcher:
         if not self._proposals:
             return pd.DataFrame(columns=["payment_id", "rule_id", "invoices", "day"])
         return pd.concat(self._proposals, ignore_index=True)
+
+    # --- Diagnostics pour l'évaluation (sans effet sur les décisions) ------------------------------------------
+
+    def _record_info(self, ctx, alloc, batch_ids) -> None:
+        """Allocation de chaque paiement le jour de son arrivée : client file, statut, route IBAN, débiteurs."""
+        new = ctx.batch["is_new"].to_numpy()
+        ids = batch_ids[new]
+        cand = alloc.candidates
+        cand = cand[cand["payment_id"].isin(ids)].sort_values(["payment_id", "rank"], kind="mergesort")
+        debtors = cand.groupby("payment_id", sort=False)["debtor_id"].agg(list)
+        payments = alloc.payments
+        self._info.append(pd.DataFrame({
+            "payment_id": ids, "client_file_id": payments["client_file_id"].to_numpy()[new],
+            "allocation_status": payments["status"].to_numpy()[new],
+            "iban_route": payments["iban_route"].to_numpy()[new],
+            "allocation_debtors": [debtors.get(i, []) for i in ids]}))
+
+    def side_outputs(self) -> dict[str, pd.DataFrame]:
+        out = {"proposals": self.proposals()}
+        if self._info:
+            out["payment_info"] = pd.concat(self._info, ignore_index=True).drop_duplicates("payment_id")
+        return out
 
 
 def rule_alone_metrics(proposals: pd.DataFrame, truth: pd.DataFrame, scope: pd.DataFrame,

@@ -5,15 +5,13 @@ import streamlit as st
 
 from src.timeline.split import PERIODS
 from src.ui.common import (
-    SYNTHETIC, current_settings, dataset, load_meta, render_model, reports_dir, run_task, save_section,
-    settings_path, step_header,
+    PERIOD_LABELS, current_settings, diagnostic, interim_dir, load_meta, num, render_model, reports_dir, run_task,
+    save_section, step_header,
 )
 
 step_header("allocation")
 settings = current_settings()
 alloc = settings.allocation
-PERIOD_LABELS = {"train": "Entraînement", "validation": "Validation", "test": "Test (backtest)",
-                 "all": "Tout l'historique"}
 
 # --- Paramètres -------------------------------------------------------------------------------------
 with st.expander("Signaux et paramètres", icon=":material/tune:", expanded=False):
@@ -33,6 +31,41 @@ with st.expander("Signaux et paramètres", icon=":material/tune:", expanded=Fals
     save_section(settings, "allocation", values, "allocation")
     st.caption("Le signal montant est une extension du brief (clé « montant exact » de la spec) : il départage "
                "les paiements sans référence ni IBAN exploitable.")
+
+# --- Client files -------------------------------------------------------------------------------------
+with st.expander("Diagnostic des client files", icon=":material/description:"):
+    st.caption("Un client file n'est rattaché à un paiement que si son montant total égale exactement le montant du "
+               "paiement et qu'au moins un indice le corrobore (date à ± tolérance, IBAN, référence de virement dans "
+               "le libellé), sans ambiguïté. Le diagnostic retrouve le vrai paiement de chaque fichier par les "
+               "factures citées et les imputations réelles, puis mesure chaque condition.")
+    if st.toggle("Calculer (quelques secondes, mis en cache)", key="allocation.client_files"):
+        cf = diagnostic("client_file_conditions", interim_dir(settings), alloc.signals.client_file.date_tolerance_days)
+        if cf is None:
+            st.info("Aucun client file chargé : remplir client_file et client_file_line dans schema.yaml "
+                    "(page Configuration).")
+        else:
+            m = st.columns(3)
+            m[0].metric("Client files", num(cf["fichiers"]))
+            m[1].metric("Lignes", num(cf["lignes"]))
+            m[2].metric("Vrai paiement retrouvé", num(cf["vrai paiement retrouvé"]),
+                        help="Fichiers dont une ligne cite une facture unique imputée par un paiement réel.")
+            left, right = st.columns(2, gap="large")
+            ratio = st.column_config.ProgressColumn("part", min_value=0, max_value=1, format="percent")
+            with left:
+                st.markdown("**Conditions du rattachement** (fichiers dont le vrai paiement est connu)")
+                st.dataframe(cf["conditions"].rename("part").rename_axis("condition").reset_index(), hide_index=True,
+                             width="stretch", column_config={"part": ratio})
+            with right:
+                st.markdown("**Remplissage des champs utilisés**")
+                st.dataframe(cf["remplissage"].rename("part").rename_axis("champ").reset_index(), hide_index=True,
+                             width="stretch", column_config={"part": ratio})
+                st.markdown("**Références des lignes** (égalité exacte après normalisation)")
+                st.dataframe(cf["références des lignes"].rename("part").rename_axis("la référence désigne")
+                             .reset_index(), hide_index=True, width="stretch", column_config={"part": ratio})
+            st.markdown("**Délai de réception du fichier − date de valeur (jours)** et **écart montant total − "
+                        "paiement quand il n'est pas nul (€)**")
+            st.dataframe(pd.DataFrame({"délai (j)": cf["délai de réception (j)"],
+                                       "écart (€)": cf["écart total − paiement (€)"]}).T.round(2), width="stretch")
 
 # --- Mesure ---------------------------------------------------------------------------------------------
 st.subheader("Mesure du rappel")

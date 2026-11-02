@@ -1,3 +1,4 @@
+import altair as alt
 import pandas as pd
 import pyarrow.parquet as pq
 import streamlit as st
@@ -5,9 +6,10 @@ import streamlit as st
 from src.config import resolve_path
 from src.load.normalize import label_numbers, normalize_text, reference_keys
 from src.synthetic.generate import SyntheticConfig  # synthétique seulement
+from src.timeline.split import SplitError
 from src.ui.common import (
-    SYNTHETIC, current_settings, dataset, interim_dir, load_meta, read_report, run_task, schema_path,
-    settings_path, step_header,
+    SYNTHETIC, current_settings, data_split, dataset, diagnostic, interim_dir, load_meta, num, read_report, run_task,
+    schema_path, step_header,
 )
 
 step_header("load")
@@ -63,7 +65,8 @@ m[4].metric("Anomalies", n_issues)
 st.caption(f"Source `{meta['source']}` · normalisation v{meta['normalization_version']} · "
            f"journal `{meta['journal_sha256'][:16]}…`")
 
-tabs = st.tabs(["Anomalies", "Champs manquants", "Plages de dates", "Journal", "Temps d'exécution", "Tables"])
+tabs = st.tabs(["Anomalies", "Champs manquants", "Plages de dates", "Journal", "Volumétrie", "Temps d'exécution",
+                "Tables"])
 with tabs[0]:
     if issues is None or issues.empty or n_issues == 0:
         st.success("Aucune anomalie détectée.", icon=":material/check_circle:")
@@ -86,10 +89,44 @@ with tabs[3]:
     if events is not None:
         st.dataframe(events, hide_index=True, width="stretch")
 with tabs[4]:
+    st.caption("Ce qui grossit avec la longueur de l'historique. Le restant dû n'est reconstruit que par les "
+               "imputations : une facture jamais soldée reste ouverte et pèse sur chaque jour du rejeu (règle R3, "
+               "allocation par montant, candidats ML).")
+    if st.toggle("Calculer le stock de factures ouvertes (quelques secondes par million de factures, mis en cache)",
+                 key="load.volumetry"):
+        try:
+            stock = diagnostic("open_invoice_stock", interim_dir(settings), data_split(settings))
+        except SplitError as exc:
+            st.error(f"Découpage impossible avec les réglages actuels : {exc}")
+            st.stop()
+        total, debtors = stock["total"], stock["debtors"]
+        v = st.columns(4)
+        v[0].metric("Factures", num(total["factures"]))
+        v[1].metric("Ouvertes au début du test", num(total["ouvertes au début du test"]),
+                    help=f"Début du test : {total['début du test']:%d/%m/%Y}")
+        v[2].metric("Débiteurs avec factures ouvertes", num(debtors["débiteurs avec factures ouvertes"]))
+        v[3].metric("Factures ouvertes du plus gros débiteur", num(debtors["maximum"]),
+                    help=f"Médiane {debtors['factures ouvertes par débiteur (médiane)']:.0f}, P99 {debtors['P99']:.0f} ; "
+                         f"les 10 plus gros portent {debtors['part portée par les 10 plus gros']:.0%} du stock.")
+        curve = stock["curve"].melt(id_vars="mois", value_vars=["ouvertes", "créées", "soldées"], var_name="série",
+                                    value_name="factures")
+        st.altair_chart(alt.Chart(curve).mark_line(point=True).encode(
+            x=alt.X("mois:T", title=None, axis=alt.Axis(format="%m/%Y")), y=alt.Y("factures:Q", title="Factures"),
+            color=alt.Color("série:N", title=None, legend=alt.Legend(orient="top")),
+            tooltip=[alt.Tooltip("mois:T", format="%m/%Y"), "série:N", alt.Tooltip("factures:Q", format=",")],
+        ).properties(height=260, title="Stock en début de mois (créées et soldées : cumuls)"), width="stretch")
+        st.markdown("**Âge du stock ouvert au début du test** (retard par rapport à l'échéance)")
+        st.dataframe(stock["age"], hide_index=True, width="stretch", column_config={
+            "factures": st.column_config.NumberColumn(format="localized"),
+            "part": st.column_config.ProgressColumn(min_value=0, max_value=1, format="percent"),
+            "jamais imputées": st.column_config.NumberColumn(format="localized")})
+        st.caption("Les factures très en retard et jamais imputées sont probablement soldées hors du périmètre "
+                   "(avoir, passage en perte, autre canal) : à confirmer avec le métier avant de les exclure.")
+with tabs[5]:
     timings = meta.get("timings_s", {})
     st.dataframe(pd.DataFrame({"étape": list(timings), "secondes": list(timings.values())}),
                  hide_index=True, width="content")
-with tabs[5]:
+with tabs[6]:
     if volumes is not None:
         st.dataframe(volumes, hide_index=True, width="content")
 

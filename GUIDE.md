@@ -449,7 +449,8 @@ Pour itérer vite : travailler à 50 000 paiements (quelques minutes de bout en 
 
 - **Notebook** : `notebooks/pipeline.ipynb` — une cellule par étape.
 - **API** : `from src.api import Project` — voir `README.md`.
-- **Interface** : `streamlit run src/ui/app.py` — mêmes méthodes, lancées dans un processus séparé.
+- **Interface** : `streamlit run src/ui/app.py` — mêmes méthodes, lancées dans un processus séparé ; une
+  page par étape (réglages, résultats, diagnostics), une vue d'ensemble et une page « Temps de run ».
 - **Paramètres** : `config/settings.yaml` (commenté, un bloc par étape), `config/rules.yaml`
   (règles versionnées), `config/schema.yaml` (mapping des sources réelles).
 - **Données réelles** : remplir `config/schema.yaml`, puis `Project(dataset="real").load()` ; lire le

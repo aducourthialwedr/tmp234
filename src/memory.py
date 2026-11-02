@@ -320,6 +320,22 @@ def _session(df: pd.DataFrame, session: int | None) -> pd.DataFrame:
     return df[df["session"] == df["session"].unique()[session]]
 
 
+def sessions(path: str | Path = "reports/memory.csv") -> pd.DataFrame:
+    """Une ligne par démarrage du suivi : début, durée, étapes exécutées, pic de mémoire (le plus récent en dernier)."""
+    raw = pd.read_csv(path, dtype=str, keep_default_na=False)
+    starts = raw.loc[raw["step"] == _START, "time"].reset_index(drop=True)
+    df = read_history(path)
+    cols = ["session", "début", "minutes", "étapes", "pic_rss_gb"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    steps = df[~df["step"].isin(["", IDLE])].groupby("session")["step"].agg(lambda s: " · ".join(dict.fromkeys(s)))
+    out = df.groupby("session").agg(minutes=("elapsed_s", "max"), pic_rss_gb=("rss_gb", "max")).reset_index()
+    out["minutes"] = out["minutes"] / 60
+    out["début"] = out["session"].map(lambda k: starts.iloc[k - 1] if 0 < k <= len(starts) else "")
+    out["étapes"] = out["session"].map(steps).fillna("")
+    return out[cols]
+
+
 def by_phase(path: str | Path = "reports/memory.csv", session: int | None = -1) -> pd.DataFrame:
     """Pic de mémoire par (étape, sous-étape), dans l'ordre d'exécution, pour la dernière session
     (`session=None` : toutes). Mesure : mémoire anonyme du pod si disponible, sinon RSS du processus."""

@@ -66,3 +66,29 @@ def test_disabled_profiler_has_no_effect(tmp_path):
     with prof("rien"):
         pass
     assert prof.runs == {} and not (tmp_path / "p").exists()
+
+
+def test_saved_runs_are_read_back(tmp_path):
+    prof = profiling.Profiler(tmp_path / "profiles", engine="thread", rate=50, log=lambda _: None)
+    with prof("règles · test"):
+        _busy(0.3)
+    runs = profiling.saved_runs(tmp_path / "profiles")
+    assert runs["nom"].tolist() == ["règles · test"] and runs.loc[0, "moteur"] == "fil interne"
+    table = profiling.saved_summary(runs.iloc[0].to_dict())
+    assert 0.15 < table["propre (s)"].sum() < 0.8
+
+
+def test_sessions_list_each_monitor_start(tmp_path):
+    path = tmp_path / "mem.csv"
+    for step in ("load", "replay"):
+        m = MemoryMonitor(path, interval=10, echo=lambda _: None).start()
+        try:
+            memory.mark_step(step)
+            m.sample()
+            memory.mark_step(memory.IDLE)
+            m.sample()
+        finally:
+            m.stop()
+    sessions = memory.sessions(path)
+    assert sessions["étapes"].tolist() == ["load", "replay"]
+    assert sessions["début"].str.len().gt(0).all()
